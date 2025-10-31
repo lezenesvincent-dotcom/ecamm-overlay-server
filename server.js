@@ -25,7 +25,11 @@ app.use((req, res, next) => {
 app.use(express.static('public'));
 
 // ========== STOCKAGE DES DONNÉES ==========
-// Format attendu par la page Création
+// Historique des contenus (max 50)
+let contentHistory = [];
+const MAX_HISTORY = 50;
+
+// Dernières données pour compatibilité
 let latestData = {
   titre: "En attente...",
   soustitre: "",
@@ -71,7 +75,24 @@ wss.on('connection', (ws, req) => {
       // Si c'est une mise à jour depuis la page de gestion
       if (parsed.type === 'update') {
         latestData = parsed.data;
+        
+        // Ajouter à l'historique avec timestamp et ID unique
+        const historyItem = {
+          ...parsed.data,
+          id: 'ws-' + Date.now(),
+          timestamp: new Date().toISOString(),
+          source: 'websocket'
+        };
+        
+        contentHistory.unshift(historyItem); // Ajouter au début
+        
+        // Limiter la taille de l'historique
+        if (contentHistory.length > MAX_HISTORY) {
+          contentHistory = contentHistory.slice(0, MAX_HISTORY);
+        }
+        
         console.log('🔄 Données mises à jour:', latestData.titre);
+        console.log('📊 Historique: ', contentHistory.length, 'éléments');
         console.log('📊 Données complètes:', JSON.stringify(latestData, null, 2));
         
         // Diffuser à tous les clients (overlays eCamm)
@@ -163,12 +184,34 @@ app.get('/api/data', (req, res) => {
   res.json(latestData);
 });
 
+// Route pour récupérer tout l'historique
+app.get('/api/history', (req, res) => {
+  console.log('📥 GET /api/history - Historique envoyé:', contentHistory.length, 'éléments');
+  res.json(contentHistory);
+});
+
 // Route pour mettre à jour les données via HTTP POST (optionnel)
 app.use(express.json());
 app.post('/api/data', (req, res) => {
   try {
     latestData = req.body;
+    
+    // Ajouter à l'historique
+    const historyItem = {
+      ...req.body,
+      id: 'post-' + Date.now(),
+      timestamp: new Date().toISOString(),
+      source: 'http'
+    };
+    
+    contentHistory.unshift(historyItem);
+    
+    if (contentHistory.length > MAX_HISTORY) {
+      contentHistory = contentHistory.slice(0, MAX_HISTORY);
+    }
+    
     console.log('🔄 Données mises à jour via POST:', latestData.titre);
+    console.log('📊 Historique:', contentHistory.length, 'éléments');
     
     // Diffuser aux clients WebSocket
     clients.forEach(client => {
