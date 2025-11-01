@@ -200,6 +200,30 @@ app.post('/api/focus', (req, res) => {
     });
 });
 
+// DELETE /api/history/:id - Supprimer un élément de l'historique
+app.delete('/api/history/:id', (req, res) => {
+    const { id } = req.params;
+    
+    const initialLength = contentHistory.length;
+    contentHistory = contentHistory.filter(item => item.id !== id);
+    
+    if (contentHistory.length < initialLength) {
+        console.log(`🗑️ Élément supprimé: ${id}`);
+        console.log(`   📚 Historique: ${contentHistory.length} élément(s) restant(s)`);
+        
+        res.json({ 
+            success: true, 
+            message: 'Élément supprimé',
+            remainingCount: contentHistory.length
+        });
+    } else {
+        res.status(404).json({ 
+            success: false, 
+            error: 'Élément non trouvé' 
+        });
+    }
+});
+
 // Démarrer le serveur
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
