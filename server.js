@@ -1,239 +1,212 @@
-// server.js - Serveur WebSocket pour eCamm Overlay
 const express = require('express');
-const { WebSocketServer } = require('ws');
+const WebSocket = require('ws');
 const http = require('http');
+const cors = require('cors');
+
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocket.Server({ server });
 
-// ========== CORS MIDDLEWARE ==========
-// Autoriser les requêtes depuis GitHub Pages
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    
-    // Handle preflight requests
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    
-    next();
-});
+// Configuration
+app.use(cors());
+app.use(express.json());
 
-// Pour servir des fichiers statiques si besoin
-app.use(express.static('public'));
+// Stockage des clients connectés
+const clients = new Set();
 
-// ========== STOCKAGE DES DONNÉES ==========
 // Historique des contenus (max 50)
 let contentHistory = [];
 const MAX_HISTORY = 50;
 
-// Dernières données pour compatibilité
+// Dernières données
 let latestData = {
-  titre: "En attente...",
-  soustitre: "",
-  p1: {
-    sujet: "",
-    contenu: []
-  },
-  p2: {
-    sujet: "",
-    contenu: []
-  },
-  p3: {
-    sujet: "",
-    contenu: []
-  },
-  p4: {
-    sujet: "",
-    contenu: []
-  }
+    titre: '',
+    soustitre: '',
+    p1: { sujet: '', contenu: [] },
+    p2: { sujet: '', contenu: [] },
+    p3: { sujet: '', contenu: [] },
+    p4: { sujet: '', contenu: [] }
 };
 
-// Garder une trace de tous les clients connectés
-const clients = new Set();
+// Index du sujet actuellement focalisé (0 = tous visibles)
+let currentFocusIndex = 0;
+
+console.log('🚀 Serveur WebSocket P1-P4 démarré');
+console.log('📦 Historique: max', MAX_HISTORY, 'éléments');
 
 // Gestion des connexions WebSocket
-wss.on('connection', (ws, req) => {
-  console.log('✅ Nouveau client connecté');
-  clients.add(ws);
-  
-  // Envoyer les dernières données au nouveau client
-  ws.send(JSON.stringify({
-    type: 'initial',
-    data: latestData
-  }));
-  
-  console.log('📤 Données initiales envoyées:', latestData.titre);
-  
-  // Recevoir les messages
-  ws.on('message', (message) => {
-    try {
-      const parsed = JSON.parse(message);
-      
-      // Si c'est une mise à jour depuis la page de gestion
-      if (parsed.type === 'update') {
-        latestData = parsed.data;
-        
-        // Ajouter à l'historique avec timestamp et ID unique
-        const historyItem = {
-          ...parsed.data,
-          id: 'ws-' + Date.now(),
-          timestamp: new Date().toISOString(),
-          source: 'websocket'
-        };
-        
-        contentHistory.unshift(historyItem); // Ajouter au début
-        
-        // Limiter la taille de l'historique
-        if (contentHistory.length > MAX_HISTORY) {
-          contentHistory = contentHistory.slice(0, MAX_HISTORY);
-        }
-        
-        console.log('🔄 Données mises à jour:', latestData.titre);
-        console.log('📊 Historique: ', contentHistory.length, 'éléments');
-        console.log('📊 Données complètes:', JSON.stringify(latestData, null, 2));
-        
-        // Diffuser à tous les clients (overlays eCamm)
-        clients.forEach(client => {
-          if (client !== ws && client.readyState === 1) { // 1 = OPEN
-            client.send(JSON.stringify({
-              type: 'update',
-              data: latestData
-            }));
-          }
-        });
-        
-        console.log(`📡 Diffusé à ${clients.size - 1} autres client(s)`);
-      }
-    } catch (error) {
-      console.error('❌ Erreur parsing message:', error);
-    }
-  });
-  
-  // Gérer la déconnexion
-  ws.on('close', () => {
-    console.log('👋 Client déconnecté');
-    clients.delete(ws);
-  });
-  
-  // Gérer les erreurs
-  ws.on('error', (error) => {
-    console.error('❌ Erreur WebSocket:', error);
-    clients.delete(ws);
-  });
-});
+wss.on('connection', (ws) => {
+    console.log('✅ Nouveau client connecté');
+    clients.add(ws);
+    console.log(`   📊 Clients actifs: ${clients.size}`);
 
-// Route de test
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <title>eCamm Overlay Server</title>
-      <style>
-        body {
-          font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-          max-width: 800px;
-          margin: 50px auto;
-          padding: 20px;
-          background: #1a1a2e;
-          color: #e4e4e4;
-        }
-        h1 { color: #667eea; }
-        .status {
-          background: #16213e;
-          padding: 20px;
-          border-radius: 10px;
-          margin: 20px 0;
-          border-left: 4px solid #667eea;
-        }
-        .connected { color: #28a745; }
-        .data {
-          background: #0f3460;
-          padding: 15px;
-          border-radius: 8px;
-          margin-top: 20px;
-          font-family: 'Courier New', monospace;
-          font-size: 0.9rem;
-          overflow-x: auto;
-        }
-      </style>
-    </head>
-    <body>
-      <h1>🚀 eCamm Overlay WebSocket Server</h1>
-      <div class="status">
-        <p><strong>Status:</strong> <span class="connected">✅ Actif</span></p>
-        <p><strong>Clients connectés:</strong> ${clients.size}</p>
-        <p><strong>Dernier titre:</strong> ${latestData.titre}</p>
-      </div>
-      <div class="data">
-        <strong>📦 Dernières données:</strong>
-        <pre>${JSON.stringify(latestData, null, 2)}</pre>
-      </div>
-    </body>
-    </html>
-  `);
-});
+    // Envoyer les données initiales au nouveau client
+    ws.send(JSON.stringify({
+        type: 'initial',
+        data: latestData
+    }));
 
-// Route pour récupérer les données actuelles (API REST)
-app.get('/api/data', (req, res) => {
-  console.log('📥 GET /api/data - Données envoyées');
-  res.json(latestData);
-});
-
-// Route pour récupérer tout l'historique
-app.get('/api/history', (req, res) => {
-  console.log('📥 GET /api/history - Historique envoyé:', contentHistory.length, 'éléments');
-  res.json(contentHistory);
-});
-
-// Route pour mettre à jour les données via HTTP POST (optionnel)
-app.use(express.json());
-app.post('/api/data', (req, res) => {
-  try {
-    latestData = req.body;
-    
-    // Ajouter à l'historique
-    const historyItem = {
-      ...req.body,
-      id: 'post-' + Date.now(),
-      timestamp: new Date().toISOString(),
-      source: 'http'
-    };
-    
-    contentHistory.unshift(historyItem);
-    
-    if (contentHistory.length > MAX_HISTORY) {
-      contentHistory = contentHistory.slice(0, MAX_HISTORY);
-    }
-    
-    console.log('🔄 Données mises à jour via POST:', latestData.titre);
-    console.log('📊 Historique:', contentHistory.length, 'éléments');
-    
-    // Diffuser aux clients WebSocket
-    clients.forEach(client => {
-      if (client.readyState === 1) {
-        client.send(JSON.stringify({
-          type: 'update',
-          data: latestData
+    // Envoyer l'état du focus actuel
+    if (currentFocusIndex > 0) {
+        ws.send(JSON.stringify({
+            type: 'focus',
+            subjectIndex: currentFocusIndex
         }));
-      }
+    }
+
+    // Gérer les messages reçus
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            console.log('📨 Message reçu:', data.type);
+
+            if (data.type === 'update') {
+                latestData = data.data;
+                console.log('💾 Données mises à jour:', latestData.titre);
+
+                // Ajouter à l'historique
+                addToHistory(latestData);
+
+                // Broadcaster aux autres clients
+                broadcastToAll({
+                    type: 'update',
+                    data: latestData
+                });
+            }
+        } catch (error) {
+            console.error('❌ Erreur parsing message:', error);
+        }
     });
-    
+
+    // Gérer la déconnexion
+    ws.on('close', () => {
+        console.log('❌ Client déconnecté');
+        clients.delete(ws);
+        console.log(`   📊 Clients actifs: ${clients.size}`);
+    });
+
+    // Gérer les erreurs
+    ws.on('error', (error) => {
+        console.error('❌ Erreur WebSocket:', error);
+        clients.delete(ws);
+    });
+});
+
+// Fonction pour broadcaster à tous les clients
+function broadcastToAll(message) {
+    const messageStr = JSON.stringify(message);
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(messageStr);
+        }
+    });
+}
+
+// Fonction pour ajouter à l'historique
+function addToHistory(data) {
+    const historyItem = {
+        id: `ws-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        source: 'websocket',
+        ...data
+    };
+
+    contentHistory.unshift(historyItem);
+
+    // Limiter à MAX_HISTORY éléments
+    if (contentHistory.length > MAX_HISTORY) {
+        contentHistory = contentHistory.slice(0, MAX_HISTORY);
+    }
+
+    console.log(`📚 Historique: ${contentHistory.length} élément(s)`);
+}
+
+// Routes API
+app.get('/', (req, res) => {
+    res.send(`
+        <h1>🎥 eCamm Overlay WebSocket Server</h1>
+        <p><strong>Statut:</strong> ✅ Actif</p>
+        <p><strong>Clients connectés:</strong> ${clients.size}</p>
+        <p><strong>Historique:</strong> ${contentHistory.length}/${MAX_HISTORY} éléments</p>
+        <p><strong>Dernières données:</strong> ${latestData.titre || '(vide)'}</p>
+        <p><strong>Focus actuel:</strong> ${currentFocusIndex === 0 ? 'Tous les sujets' : `Sujet ${currentFocusIndex}`}</p>
+        <hr>
+        <h3>📡 Endpoints disponibles:</h3>
+        <ul>
+            <li>GET /api/data - Dernières données</li>
+            <li>POST /api/data - Mettre à jour les données</li>
+            <li>GET /api/history - Historique complet</li>
+            <li>POST /api/focus - Changer le focus (subjectIndex: 0-4)</li>
+        </ul>
+    `);
+});
+
+// GET /api/data - Récupérer les dernières données
+app.get('/api/data', (req, res) => {
+    console.log('📤 GET /api/data');
+    res.json(latestData);
+});
+
+// POST /api/data - Mettre à jour les données
+app.post('/api/data', (req, res) => {
+    console.log('📥 POST /api/data');
+    latestData = req.body;
+    console.log('💾 Données mises à jour:', latestData.titre);
+
+    // Ajouter à l'historique
+    addToHistory(latestData);
+
+    // Broadcaster aux clients WebSocket
+    broadcastToAll({
+        type: 'update',
+        data: latestData
+    });
+
     res.json({ success: true, data: latestData });
-  } catch (error) {
-    console.error('❌ Erreur POST:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
+});
+
+// GET /api/history - Récupérer l'historique complet
+app.get('/api/history', (req, res) => {
+    console.log('📤 GET /api/history');
+    console.log(`   📚 Envoi de ${contentHistory.length} élément(s)`);
+    res.json(contentHistory);
+});
+
+// POST /api/focus - Changer le focus sur un sujet
+app.post('/api/focus', (req, res) => {
+    const { subjectIndex } = req.body;
+    
+    // Valider l'index (0-4)
+    if (typeof subjectIndex !== 'number' || subjectIndex < 0 || subjectIndex > 4) {
+        return res.status(400).json({ 
+            success: false, 
+            error: 'subjectIndex doit être un nombre entre 0 et 4' 
+        });
+    }
+
+    currentFocusIndex = subjectIndex;
+    console.log(`🎯 Focus changé: ${currentFocusIndex === 0 ? 'Tous les sujets' : `Sujet ${currentFocusIndex}`}`);
+
+    // Broadcaster le changement de focus à tous les clients
+    broadcastToAll({
+        type: 'focus',
+        subjectIndex: currentFocusIndex
+    });
+
+    res.json({ 
+        success: true, 
+        focusIndex: currentFocusIndex,
+        message: currentFocusIndex === 0 ? 'Tous les sujets visibles' : `Focus sur sujet ${currentFocusIndex}`
+    });
 });
 
 // Démarrer le serveur
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Serveur WebSocket démarré sur le port ${PORT}`);
-  console.log(`   HTTP: http://localhost:${PORT}`);
-  console.log(`   WebSocket: ws://localhost:${PORT}`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('🚀 Serveur WebSocket P1-P4 actif');
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log(`   🌐 HTTP: http://localhost:${PORT}`);
+    console.log(`   🔌 WebSocket: ws://localhost:${PORT}`);
+    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
 });
