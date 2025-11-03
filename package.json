@@ -1,20 +1,29 @@
 {
-  "name": "ecamm-overlay-server",
-  "version": "2.0.0",
-  "description": "Serveur WebSocket pour overlays eCamm Live avec gestion du focus",
+  "name": "ecamm-overlay-websocket-server",
+  "version": "2.1.0",
+  "description": "Serveur WebSocket pour overlays eCamm Live avec gestion du focus et graphique boursier",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
-  "keywords": ["websocket", "ecamm", "overlay", "live"],
-  "author": "",
-  "license": "MIT",
+  "keywords": [
+    "websocket",
+    "ecamm",
+    "overlay",
+    "streaming"
+  ],
+  "author": "Vincent Lezenes",
+  "license": "ISC",
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.14.2",
     "cors": "^2.8.5"
   },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.x"
   }
 }
