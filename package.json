@@ -1,7 +1,7 @@
 {
   "name": "ecamm-overlay-websocket-server",
-  "version": "2.1.0",
-  "description": "Serveur WebSocket pour overlays eCamm Live avec gestion du focus et graphique boursier",
+  "version": "2.0.0",
+  "description": "Serveur WebSocket pour overlays eCamm Live avec persistance et backups automatiques",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,9 @@
     "websocket",
     "ecamm",
     "overlay",
-    "streaming"
+    "streaming",
+    "persistence",
+    "backup"
   ],
   "author": "Vincent Lezenes",
   "license": "ISC",
