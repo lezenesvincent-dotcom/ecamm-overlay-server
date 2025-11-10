@@ -2,8 +2,6 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
-const fs = require('fs').promises;
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -14,23 +12,10 @@ app.use(cors());
 app.use(express.json());
 
 // ========================================
-// CONFIGURATION PERSISTANCE
-// ========================================
-
-const DATA_DIR = process.env.DATA_DIR || './data';
-const DATA_FILE = path.join(DATA_DIR, 'content.json');
-const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
-const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-
-// Auto-save toutes les 30 secondes
-const AUTO_SAVE_INTERVAL = 30000;
-let autoSaveTimer = null;
-let dataChanged = false;
-
-// ========================================
 // STOCKAGE EN MÉMOIRE
 // ========================================
 
+// Contenu P1-P4
 let latestData = {
     titre: 'En attente...',
     soustitre: '',
@@ -40,150 +25,32 @@ let latestData = {
     p4: { sujet: '', contenu: [] }
 };
 
-// Historique (max 100 éléments pour plus de backup)
+// NOUVEAU : Paramètres du graphique 3D
+let graphSettings = {
+    cameraOffset: { x: 0, y: 0, z: 0 },
+    cameraAngle: { yaw: 0, pitch: 0, roll: 0 },
+    graphOffset: { x: 0, y: 0, z: 0 },
+    lightPosition: { x: 10, y: 10, z: 10 },
+    lightIntensity: 1.5,
+    labelsXOffset: { x: 0, y: 0, z: 0 },
+    labelsYOffset: { x: 0, y: 0, z: 0 },
+    barreRougeOffset: { x: 0, y: 0, z: 0 },
+    barreRougeSize: { width: 0.2, height: 15, depth: 0.2 },
+    lastUpdated: new Date().toISOString()
+};
+
+// Historique (max 50 éléments)
 let contentHistory = [];
-const MAX_HISTORY = 100;
+const MAX_HISTORY = 50;
 
 // Clients WebSocket connectés
 const clients = new Set();
 
 // ========================================
-// FONCTIONS DE PERSISTANCE
-// ========================================
-
-async function ensureDataDir() {
-    try {
-        await fs.mkdir(DATA_DIR, { recursive: true });
-        await fs.mkdir(BACKUP_DIR, { recursive: true });
-        console.log('✅ Dossiers de données créés/vérifiés');
-    } catch (error) {
-        console.error('❌ Erreur création dossiers:', error);
-    }
-}
-
-async function loadData() {
-    try {
-        console.log('📂 Chargement des données depuis le disque...');
-        
-        // Charger les données principales
-        try {
-            const data = await fs.readFile(DATA_FILE, 'utf8');
-            latestData = JSON.parse(data);
-            console.log('✅ Données principales chargées');
-        } catch (error) {
-            console.log('ℹ️  Pas de données sauvegardées, utilisation des valeurs par défaut');
-        }
-        
-        // Charger l'historique
-        try {
-            const history = await fs.readFile(HISTORY_FILE, 'utf8');
-            contentHistory = JSON.parse(history);
-            console.log('✅ Historique chargé:', contentHistory.length, 'éléments');
-        } catch (error) {
-            console.log('ℹ️  Pas d\'historique sauvegardé');
-        }
-        
-        console.log('✅ Chargement terminé');
-    } catch (error) {
-        console.error('❌ Erreur chargement données:', error);
-    }
-}
-
-async function saveData() {
-    if (!dataChanged) {
-        return; // Pas de changement, pas besoin de sauvegarder
-    }
-    
-    try {
-        console.log('💾 Sauvegarde des données...');
-        
-        // Sauvegarder les données principales
-        await fs.writeFile(
-            DATA_FILE, 
-            JSON.stringify(latestData, null, 2),
-            'utf8'
-        );
-        
-        // Sauvegarder l'historique
-        await fs.writeFile(
-            HISTORY_FILE,
-            JSON.stringify(contentHistory, null, 2),
-            'utf8'
-        );
-        
-        dataChanged = false;
-        console.log('✅ Données sauvegardées avec succès');
-        
-        return true;
-    } catch (error) {
-        console.error('❌ Erreur sauvegarde:', error);
-        return false;
-    }
-}
-
-async function createBackup() {
-    try {
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const backupFile = path.join(BACKUP_DIR, `backup_${timestamp}.json`);
-        
-        const backup = {
-            timestamp: new Date().toISOString(),
-            data: latestData,
-            history: contentHistory.slice(0, 10) // 10 derniers éléments
-        };
-        
-        await fs.writeFile(backupFile, JSON.stringify(backup, null, 2));
-        console.log('✅ Backup créé:', backupFile);
-        
-        // Nettoyer les vieux backups (garder les 20 derniers)
-        await cleanOldBackups();
-    } catch (error) {
-        console.error('❌ Erreur création backup:', error);
-    }
-}
-
-async function cleanOldBackups() {
-    try {
-        const files = await fs.readdir(BACKUP_DIR);
-        const backupFiles = files
-            .filter(f => f.startsWith('backup_'))
-            .sort()
-            .reverse();
-        
-        // Supprimer les backups au-delà de 20
-        if (backupFiles.length > 20) {
-            const toDelete = backupFiles.slice(20);
-            for (const file of toDelete) {
-                await fs.unlink(path.join(BACKUP_DIR, file));
-            }
-            console.log('🗑️ Nettoyage:', toDelete.length, 'anciens backups supprimés');
-        }
-    } catch (error) {
-        console.error('❌ Erreur nettoyage backups:', error);
-    }
-}
-
-function startAutoSave() {
-    autoSaveTimer = setInterval(async () => {
-        if (dataChanged) {
-            await saveData();
-        }
-    }, AUTO_SAVE_INTERVAL);
-    
-    console.log('⏰ Auto-save activé (toutes les 30 secondes)');
-}
-
-function stopAutoSave() {
-    if (autoSaveTimer) {
-        clearInterval(autoSaveTimer);
-        console.log('⏰ Auto-save désactivé');
-    }
-}
-
-// ========================================
 // ROUTES API
 // ========================================
 
+// GET / - Page d'accueil
 app.get('/', (req, res) => {
     res.send(`
         <h1>🚀 eCamm Overlay WebSocket Server v2.0</h1>
@@ -191,63 +58,32 @@ app.get('/', (req, res) => {
         <p><strong>Connected clients:</strong> ${clients.size}</p>
         <p><strong>History size:</strong> ${contentHistory.length} items</p>
         <p><strong>Latest title:</strong> ${latestData.titre}</p>
-        <p><strong>Data changed:</strong> ${dataChanged ? '⚠️ Yes (pending save)' : '✅ No'}</p>
+        <p><strong>Graph settings last updated:</strong> ${graphSettings.lastUpdated}</p>
         <hr>
         <h3>📡 API Endpoints:</h3>
         <ul>
-            <li><strong>GET</strong> /api/data - Récupérer les dernières données</li>
-            <li><strong>GET</strong> /api/history - Récupérer tout l'historique</li>
-            <li><strong>GET</strong> /api/backups - Lister les backups disponibles</li>
-            <li><strong>POST</strong> /api/data - Mettre à jour les données</li>
-            <li><strong>POST</strong> /api/focus - Changer le focus (subjectIndex: 0-5)</li>
-            <li><strong>POST</strong> /api/save - Forcer la sauvegarde immédiate</li>
-            <li><strong>POST</strong> /api/backup - Créer un backup manuel</li>
-            <li><strong>DELETE</strong> /api/history/:id - Supprimer un élément de l'historique</li>
+            <li><strong>GET</strong> /api/data - Récupérer le contenu P1-P4</li>
+            <li><strong>POST</strong> /api/update - Mettre à jour le contenu</li>
+            <li><strong>POST</strong> /api/focus - Mettre le focus sur P1-P4 ou Graph</li>
+            <li><strong>GET</strong> /api/graph - Récupérer les paramètres du graphique 3D</li>
+            <li><strong>POST</strong> /api/graph - Sauvegarder les paramètres du graphique 3D</li>
+            <li><strong>GET</strong> /history - Historique des contenus</li>
         </ul>
         <hr>
-        <h3>💾 Persistance:</h3>
-        <ul>
-            <li>Auto-save: Toutes les 30 secondes si changements</li>
-            <li>Backup automatique: Toutes les heures</li>
-            <li>Backups gardés: 20 derniers</li>
-        </ul>
+        <h3>🔌 WebSocket:</h3>
+        <p>Connect to: <code>wss://[hostname]/</code></p>
+        <p>Message types: <code>init</code>, <code>update</code>, <code>focus</code>, <code>graph_settings</code></p>
     `);
 });
 
+// GET /api/data - Récupérer le contenu actuel
 app.get('/api/data', (req, res) => {
-    console.log('📤 GET /api/data');
     res.json(latestData);
 });
 
-app.get('/api/history', (req, res) => {
-    console.log('📤 GET /api/history -', contentHistory.length, 'éléments');
-    res.json(contentHistory);
-});
-
-app.get('/api/backups', async (req, res) => {
-    try {
-        const files = await fs.readdir(BACKUP_DIR);
-        const backups = files
-            .filter(f => f.startsWith('backup_'))
-            .sort()
-            .reverse()
-            .map(f => ({
-                filename: f,
-                path: `/api/backups/${f}`,
-                timestamp: f.replace('backup_', '').replace('.json', '')
-            }));
-        
-        res.json({ backups, count: backups.length });
-    } catch (error) {
-        res.status(500).json({ error: 'Error listing backups' });
-    }
-});
-
-app.post('/api/data', (req, res) => {
-    console.log('📥 POST /api/data');
-    
+// POST /api/update - Mettre à jour le contenu
+app.post('/api/update', (req, res) => {
     latestData = req.body;
-    dataChanged = true;
     
     // Ajouter à l'historique
     const historyItem = {
@@ -263,111 +99,106 @@ app.post('/api/data', (req, res) => {
         contentHistory = contentHistory.slice(0, MAX_HISTORY);
     }
     
-    console.log('✅ Données mises à jour (en attente de sauvegarde)');
-    
-    // Broadcaster
-    broadcastToClients({
+    // Broadcaster via WebSocket
+    const message = JSON.stringify({
         type: 'update',
         data: latestData
     });
     
-    res.json({ 
-        success: true, 
-        message: 'Données mises à jour',
-        historySize: contentHistory.length,
-        willSaveIn: `${AUTO_SAVE_INTERVAL / 1000}s max`
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
     });
+    
+    res.json({ success: true, data: latestData });
 });
 
+// POST /api/focus - Mettre le focus sur une section
 app.post('/api/focus', (req, res) => {
     const { subjectIndex } = req.body;
     
-    console.log('🎯 POST /api/focus - subjectIndex:', subjectIndex);
+    console.log(`📌 Focus demandé sur l'index: ${subjectIndex}`);
     
-    if (subjectIndex === undefined || subjectIndex === null) {
-        return res.status(400).json({ 
-            success: false, 
-            error: 'subjectIndex is required' 
-        });
-    }
-    
-    broadcastToClients({
+    // Broadcaster via WebSocket
+    const message = JSON.stringify({
         type: 'focus',
-        subjectIndex: parseInt(subjectIndex)
+        subjectIndex: subjectIndex
     });
     
-    res.json({ 
-        success: true, 
-        message: `Focus changed to subject ${subjectIndex}`,
-        clients: clients.size
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
     });
-});
-
-app.post('/api/save', async (req, res) => {
-    console.log('💾 POST /api/save - Sauvegarde forcée');
-    const success = await saveData();
-    res.json({ 
-        success, 
-        message: success ? 'Data saved successfully' : 'Save failed' 
-    });
-});
-
-app.post('/api/backup', async (req, res) => {
-    console.log('📦 POST /api/backup - Backup manuel');
-    await createBackup();
-    res.json({ success: true, message: 'Backup created' });
-});
-
-app.delete('/api/history/:id', (req, res) => {
-    const { id } = req.params;
-    const initialLength = contentHistory.length;
-    contentHistory = contentHistory.filter(item => item.id !== id);
-    dataChanged = true;
     
-    if (contentHistory.length < initialLength) {
-        res.json({ success: true, historySize: contentHistory.length });
-    } else {
-        res.status(404).json({ success: false, error: 'Item not found' });
-    }
+    res.json({ success: true, subjectIndex });
+});
+
+// GET /api/graph - Récupérer les paramètres du graphique 3D
+app.get('/api/graph', (req, res) => {
+    console.log('📊 Paramètres graphique demandés');
+    res.json(graphSettings);
+});
+
+// POST /api/graph - Sauvegarder les paramètres du graphique 3D
+app.post('/api/graph', (req, res) => {
+    const newSettings = req.body;
+    
+    // Mise à jour des paramètres
+    graphSettings = {
+        ...newSettings,
+        lastUpdated: new Date().toISOString()
+    };
+    
+    console.log('💾 Paramètres graphique sauvegardés:', graphSettings);
+    
+    // Broadcaster via WebSocket à tous les clients
+    const message = JSON.stringify({
+        type: 'graph_settings',
+        settings: graphSettings
+    });
+    
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        }
+    });
+    
+    res.json({ success: true, settings: graphSettings });
+});
+
+// GET /history - Historique des contenus
+app.get('/history', (req, res) => {
+    res.json(contentHistory);
 });
 
 // ========================================
 // WEBSOCKET
 // ========================================
 
-function broadcastToClients(message) {
-    const messageStr = JSON.stringify(message);
-    let successCount = 0;
-    
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(messageStr);
-            successCount++;
-        }
-    });
-    
-    console.log(`📡 Broadcasted à ${successCount}/${clients.size} client(s)`);
-}
-
 wss.on('connection', (ws) => {
-    console.log('🔌 Nouveau client WebSocket');
+    console.log('👤 Nouveau client WebSocket connecté');
     clients.add(ws);
-    console.log('👥 Clients:', clients.size);
+    console.log('👥 Clients connectés:', clients.size);
     
-    // Envoyer les dernières données
+    // Envoyer l'état initial (contenu P1-P4 + paramètres graph)
     ws.send(JSON.stringify({
-        type: 'initial',
-        data: latestData
+        type: 'init',
+        data: latestData,
+        graphSettings: graphSettings
     }));
     
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
+            console.log('📨 Message WebSocket reçu:', data.type);
             
             if (data.type === 'update') {
+                // Mise à jour contenu P1-P4
                 latestData = data.data;
-                dataChanged = true;
                 
+                // Ajouter à l'historique
                 const historyItem = {
                     id: 'ws-' + Date.now(),
                     timestamp: new Date().toISOString(),
@@ -381,7 +212,7 @@ wss.on('connection', (ws) => {
                     contentHistory = contentHistory.slice(0, MAX_HISTORY);
                 }
                 
-                // Broadcaster aux autres
+                // Broadcaster à tous les autres clients
                 clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
                         client.send(JSON.stringify({
@@ -391,89 +222,74 @@ wss.on('connection', (ws) => {
                     }
                 });
             }
+            
+            if (data.type === 'graph_settings') {
+                // Mise à jour paramètres graphique 3D
+                graphSettings = {
+                    ...data.settings,
+                    lastUpdated: new Date().toISOString()
+                };
+                
+                console.log('💾 Paramètres graphique mis à jour via WebSocket');
+                
+                // Broadcaster à tous les autres clients
+                clients.forEach(client => {
+                    if (client !== ws && client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'graph_settings',
+                            settings: graphSettings
+                        }));
+                    }
+                });
+            }
+            
+            if (data.type === 'focus') {
+                // Demande de focus sur une section
+                console.log(`📌 Focus demandé sur l'index: ${data.subjectIndex}`);
+                
+                // Broadcaster à tous les clients
+                clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'focus',
+                            subjectIndex: data.subjectIndex
+                        }));
+                    }
+                });
+            }
+            
         } catch (error) {
-            console.error('❌ Erreur WebSocket:', error);
+            console.error('❌ Erreur parsing message WebSocket:', error);
         }
     });
     
     ws.on('close', () => {
-        console.log('🔌 Client déconnecté');
+        console.log('🔌 Client WebSocket déconnecté');
         clients.delete(ws);
-        console.log('👥 Clients:', clients.size);
+        console.log('👥 Clients connectés:', clients.size);
     });
     
     ws.on('error', (error) => {
-        console.error('❌ Erreur:', error);
+        console.error('❌ Erreur WebSocket:', error);
         clients.delete(ws);
     });
 });
 
 // ========================================
-// BACKUP AUTOMATIQUE (toutes les heures)
+// DÉMARRAGE DU SERVEUR
 // ========================================
 
-setInterval(async () => {
-    console.log('📦 Backup automatique horaire...');
-    await createBackup();
-}, 3600000); // 1 heure
-
-// ========================================
-// GRACEFUL SHUTDOWN
-// ========================================
-
-async function shutdown() {
-    console.log('\n⚠️  Arrêt du serveur...');
-    
-    stopAutoSave();
-    
-    // Sauvegarder avant de quitter
-    if (dataChanged) {
-        console.log('💾 Sauvegarde finale...');
-        await saveData();
-    }
-    
-    // Créer un backup final
-    await createBackup();
-    
-    console.log('✅ Arrêt propre terminé');
-    process.exit(0);
-}
-
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-
-// ========================================
-// DÉMARRAGE
-// ========================================
-
-async function start() {
-    console.log('🚀 Démarrage du serveur...');
-    
-    await ensureDataDir();
-    await loadData();
-    startAutoSave();
-    
-    const PORT = process.env.PORT || 3000;
-    server.listen(PORT, () => {
-        console.log('');
-        console.log('🚀 ========================================');
-        console.log('   eCamm Overlay Server v2.0');
-        console.log('   📡 AVEC PERSISTANCE');
-        console.log('🚀 ========================================');
-        console.log('');
-        console.log(`   🌐 HTTP: http://localhost:${PORT}`);
-        console.log(`   🔌 WebSocket: ws://localhost:${PORT}`);
-        console.log('');
-        console.log('   💾 Auto-save: Toutes les 30s');
-        console.log('   📦 Backup: Toutes les heures');
-        console.log('   📂 Données:', DATA_FILE);
-        console.log('   📚 Historique:', HISTORY_FILE);
-        console.log('');
-        console.log('   ✅ Serveur prêt !');
-        console.log('');
-        console.log('🚀 ========================================');
-        console.log('');
-    });
-}
-
-start();
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log('');
+    console.log('🚀 ========================================');
+    console.log('   eCamm Overlay WebSocket Server v2.0');
+    console.log('🚀 ========================================');
+    console.log('');
+    console.log('   📡 HTTP Server: http://localhost:' + PORT);
+    console.log('   🔌 WebSocket: ws://localhost:' + PORT);
+    console.log('');
+    console.log('   ✅ Serveur démarré avec succès !');
+    console.log('   📊 Persistance graphique 3D activée');
+    console.log('');
+});
