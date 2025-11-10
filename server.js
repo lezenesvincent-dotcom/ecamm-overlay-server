@@ -1,3 +1,9 @@
+// ========================================
+// eCamm Overlay WebSocket Server v2.0
+// Version: 2.0 - 10 novembre 2025
+// Ajout: Persistance graphique 3D
+// ========================================
+
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
