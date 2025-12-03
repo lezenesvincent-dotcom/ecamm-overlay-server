@@ -12,9 +12,88 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================
+// CONFIGURATION GITHUB GIST (Persistance)
+// ============================================
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const GIST_ID = process.env.GIST_ID || '';
+const GIST_FILENAME = 'ecamm-overlay-history.json';
+
+// ============================================
 // ÉTAT GLOBAL - P1P4 Content
 // ============================================
 let contentStore = [];
+let lastSaveTime = 0;
+const SAVE_INTERVAL = 10000; // Sauvegarder au max toutes les 10 secondes
+
+// ============================================
+// FONCTIONS GITHUB GIST
+// ============================================
+async function loadFromGist() {
+    if (!GITHUB_TOKEN || !GIST_ID) {
+        console.log('⚠️ Gist non configuré - pas de persistance');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+            headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        });
+        
+        if (response.ok) {
+            const gist = await response.json();
+            if (gist.files && gist.files[GIST_FILENAME]) {
+                const content = JSON.parse(gist.files[GIST_FILENAME].content);
+                contentStore = content.history || [];
+                console.log(`✅ Historique chargé depuis Gist: ${contentStore.length} éléments`);
+            }
+        } else {
+            console.log('⚠️ Gist non trouvé, démarrage avec historique vide');
+        }
+    } catch (error) {
+        console.error('❌ Erreur chargement Gist:', error.message);
+    }
+}
+
+async function saveToGist() {
+    if (!GITHUB_TOKEN || !GIST_ID) return;
+    
+    // Limiter la fréquence de sauvegarde
+    const now = Date.now();
+    if (now - lastSaveTime < SAVE_INTERVAL) return;
+    lastSaveTime = now;
+    
+    try {
+        const response = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+            method: 'PATCH',
+            headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                files: {
+                    [GIST_FILENAME]: {
+                        content: JSON.stringify({
+                            lastUpdate: new Date().toISOString(),
+                            history: contentStore
+                        }, null, 2)
+                    }
+                }
+            })
+        });
+        
+        if (response.ok) {
+            console.log(`💾 Historique sauvegardé sur Gist: ${contentStore.length} éléments`);
+        } else {
+            console.error('❌ Erreur sauvegarde Gist:', response.status);
+        }
+    } catch (error) {
+        console.error('❌ Erreur sauvegarde Gist:', error.message);
+    }
+}
 let currentContent = {
     titre: '',
     soustitre: '',
@@ -111,6 +190,23 @@ wss.on('connection', (ws) => {
                     }
                 });
             }
+            
+            // Message de type 'control' pour les commandes du joystick
+            if (data.type === 'control') {
+                console.log('🎮 Commande control reçue:', data.command);
+                
+                // Broadcaster à tous les autres clients (widgets)
+                clients.forEach(client => {
+                    if (client !== ws && client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'control',
+                            command: data.command,
+                            state: data.state
+                        }));
+                    }
+                });
+                console.log('📤 Commande diffusée aux widgets');
+            }
 
         } catch (error) {
             console.error('❌ Erreur parsing message:', error);
@@ -177,6 +273,7 @@ app.post('/api/history', (req, res) => {
     }
     
     console.log('📚 Historique mis à jour:', contentStore.length, 'éléments');
+    saveToGist(); // Sauvegarder sur Gist
     res.json({ success: true, item });
 });
 
@@ -195,7 +292,7 @@ app.post('/api/data', (req, res) => {
     }
     
     // Aussi mettre à jour currentContent et broadcaster
-    if (req.body.titre) {
+    if (req.body.titre || req.body.title) {
         currentContent = {
             titre: req.body.title || req.body.titre || '',
             soustitre: req.body.subtitle || req.body.soustitre || '',
@@ -215,6 +312,7 @@ app.post('/api/data', (req, res) => {
         });
     }
     
+    saveToGist(); // Sauvegarder sur Gist
     res.json({ success: true, data: item });
 });
 
@@ -223,6 +321,7 @@ app.delete('/api/history/:id', (req, res) => {
     const id = req.params.id;
     contentStore = contentStore.filter(item => item.id !== id);
     console.log('🗑️ Élément supprimé:', id);
+    saveToGist(); // Sauvegarder sur Gist
     res.json({ success: true });
 });
 
@@ -242,10 +341,17 @@ app.post('/api/settings', (req, res) => {
 // Route de test / Status
 // ============================================
 app.get('/', (req, res) => {
+    const gistStatus = GITHUB_TOKEN && GIST_ID 
+        ? `✅ Actif (Gist ID: ${GIST_ID.substring(0, 8)}...)` 
+        : '⚠️ Non configuré';
+    
     res.send(`
         <h1>🚀 Serveur eCamm Overlay</h1>
         <p>✅ Serveur actif</p>
         <p>👥 Clients WebSocket connectés: ${clients.size}</p>
+        <hr>
+        <h2>💾 Persistance Gist</h2>
+        <p>Status: ${gistStatus}</p>
         <hr>
         <h2>📺 P1P4 Content</h2>
         <p>Titre actuel: ${currentContent.titre || '(vide)'}</p>
@@ -269,7 +375,7 @@ app.get('/', (req, res) => {
 // Démarrage du serveur
 // ============================================
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
     console.log('');
     console.log('🚀 ========================================');
     console.log('   Serveur eCamm Overlay');
@@ -281,5 +387,16 @@ server.listen(PORT, () => {
     console.log('   ✅ P1P4 Content API: Actif');
     console.log('   ✅ Graph 3D Settings: Actif');
     console.log('   ✅ WebSocket Broadcast: Actif');
+    
+    // Charger l'historique depuis Gist
+    if (GITHUB_TOKEN && GIST_ID) {
+        console.log('   🔄 Chargement historique depuis Gist...');
+        await loadFromGist();
+        console.log(`   ✅ Gist Persistance: Actif (${contentStore.length} éléments)`);
+    } else {
+        console.log('   ⚠️ Gist non configuré - historique en mémoire uniquement');
+        console.log('   💡 Ajoutez GITHUB_TOKEN et GIST_ID dans Render');
+    }
+    
     console.log('');
 });
