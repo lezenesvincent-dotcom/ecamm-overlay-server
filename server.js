@@ -544,7 +544,15 @@ wss.on('connection', (ws) => {
                     }
                 });
             }
-
+if (data.type === 'synthe_update') {
+                const msg = JSON.stringify({ type: 'synthe_update', data: data.data });
+                clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(msg);
+                    }
+                });
+                console.log('🎬 Synthé update:', data.data ? data.data.nom : 'OFF');
+            }
         } catch (error) {
             console.error('❌ Erreur parsing message WebSocket:', error);
         }
