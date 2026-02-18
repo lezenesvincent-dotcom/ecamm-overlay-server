@@ -2,30 +2,26 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
-const fs = require('fs').promises;
+const nodemailer = require('nodemailer');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// Dossier vidéos sur le disque persistant
+const VIDEOS_DIR = '/app/data/videos';
+if (!fs.existsSync(VIDEOS_DIR)) {
+    fs.mkdirSync(VIDEOS_DIR, { recursive: true });
+}
+
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
-// ========================================
-// CONFIGURATION PERSISTANCE
-// ========================================
-
-const DATA_DIR = process.env.DATA_DIR || './data';
-const DATA_FILE = path.join(DATA_DIR, 'content.json');
-const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
-const BACKUP_DIR = path.join(DATA_DIR, 'backups');
-
-// Auto-save toutes les 30 secondes
-const AUTO_SAVE_INTERVAL = 30000;
-let autoSaveTimer = null;
-let dataChanged = false;
+// Servir les vidéos statiques depuis le disque persistant
+app.use('/videos', express.static(VIDEOS_DIR));
 
 // ========================================
 // STOCKAGE EN MÉMOIRE
@@ -40,144 +36,93 @@ let latestData = {
     p4: { sujet: '', contenu: [] }
 };
 
-// Historique (max 100 éléments pour plus de backup)
+let graphSettings = {
+    cameraOffset: { x: 0, y: 0, z: 0 },
+    cameraAngle: { yaw: 0, pitch: 0, roll: 0 },
+    graphOffset: { x: 0, y: 0, z: 0 },
+    lightPosition: { x: 10, y: 10, z: 10 },
+    lightIntensity: 1.5,
+    labelsXOffset: { x: 0, y: 0, z: 0 },
+    labelsYOffset: { x: 0, y: 0, z: 0 },
+    barreRougeOffset: { x: 0, y: 0, z: 0 },
+    barreRougeSize: { width: 0.2, height: 15, depth: 0.2 },
+    lastUpdated: new Date().toISOString()
+};
+
 let contentHistory = [];
-const MAX_HISTORY = 100;
-
-// Clients WebSocket connectés
+const MAX_HISTORY = 50;
 const clients = new Set();
+let fichesStore = {};
 
 // ========================================
-// FONCTIONS DE PERSISTANCE
+// EMAIL + ICS CALENDAR
 // ========================================
 
-async function ensureDataDir() {
-    try {
-        await fs.mkdir(DATA_DIR, { recursive: true });
-        await fs.mkdir(BACKUP_DIR, { recursive: true });
-        console.log('✅ Dossiers de données créés/vérifiés');
-    } catch (error) {
-        console.error('❌ Erreur création dossiers:', error);
+const mailTransporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: 'lezenes.vincent@gmail.com',
+        pass: process.env.GMAIL_APP_PASSWORD || ''
     }
-}
+});
 
-async function loadData() {
-    try {
-        console.log('📂 Chargement des données depuis le disque...');
-        
-        // Charger les données principales
-        try {
-            const data = await fs.readFile(DATA_FILE, 'utf8');
-            latestData = JSON.parse(data);
-            console.log('✅ Données principales chargées');
-        } catch (error) {
-            console.log('ℹ️  Pas de données sauvegardées, utilisation des valeurs par défaut');
-        }
-        
-        // Charger l'historique
-        try {
-            const history = await fs.readFile(HISTORY_FILE, 'utf8');
-            contentHistory = JSON.parse(history);
-            console.log('✅ Historique chargé:', contentHistory.length, 'éléments');
-        } catch (error) {
-            console.log('ℹ️  Pas d\'historique sauvegardé');
-        }
-        
-        console.log('✅ Chargement terminé');
-    } catch (error) {
-        console.error('❌ Erreur chargement données:', error);
-    }
-}
+// Compteur de séquence par fiche (pour mettre à jour les events existants)
+const icsSequenceMap = {};
 
-async function saveData() {
-    if (!dataChanged) {
-        return; // Pas de changement, pas besoin de sauvegarder
-    }
-    
-    try {
-        console.log('💾 Sauvegarde des données...');
-        
-        // Sauvegarder les données principales
-        await fs.writeFile(
-            DATA_FILE, 
-            JSON.stringify(latestData, null, 2),
-            'utf8'
-        );
-        
-        // Sauvegarder l'historique
-        await fs.writeFile(
-            HISTORY_FILE,
-            JSON.stringify(contentHistory, null, 2),
-            'utf8'
-        );
-        
-        dataChanged = false;
-        console.log('✅ Données sauvegardées avec succès');
-        
-        return true;
-    } catch (error) {
-        console.error('❌ Erreur sauvegarde:', error);
-        return false;
-    }
-}
+function generateICS(cal) {
+    const title = cal.title || 'Studio CIC';
+    const location = cal.location || 'Studio CIC - 61 rue Taitbout, Paris 9e';
+    const date = cal.date || new Date().toISOString().split('T')[0];
+    const startTime = cal.startTime || '12:30';
+    const endTime = cal.endTime || '13:00';
+    const ficheId = cal.ficheId || Date.now().toString();
 
-async function createBackup() {
-    try {
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const backupFile = path.join(BACKUP_DIR, `backup_${timestamp}.json`);
-        
-        const backup = {
-            timestamp: new Date().toISOString(),
-            data: latestData,
-            history: contentHistory.slice(0, 10) // 10 derniers éléments
-        };
-        
-        await fs.writeFile(backupFile, JSON.stringify(backup, null, 2));
-        console.log('✅ Backup créé:', backupFile);
-        
-        // Nettoyer les vieux backups (garder les 20 derniers)
-        await cleanOldBackups();
-    } catch (error) {
-        console.error('❌ Erreur création backup:', error);
-    }
-}
+    // UID stable basé sur ficheId → même fiche = même event = mise à jour
+    const uid = 'fiche-' + ficheId + '@studio-cic';
 
-async function cleanOldBackups() {
-    try {
-        const files = await fs.readdir(BACKUP_DIR);
-        const backupFiles = files
-            .filter(f => f.startsWith('backup_'))
-            .sort()
-            .reverse();
-        
-        // Supprimer les backups au-delà de 20
-        if (backupFiles.length > 20) {
-            const toDelete = backupFiles.slice(20);
-            for (const file of toDelete) {
-                await fs.unlink(path.join(BACKUP_DIR, file));
-            }
-            console.log('🗑️ Nettoyage:', toDelete.length, 'anciens backups supprimés');
-        }
-    } catch (error) {
-        console.error('❌ Erreur nettoyage backups:', error);
-    }
-}
+    // Incrémenter la séquence pour forcer la mise à jour dans Outlook
+    if (!icsSequenceMap[ficheId]) icsSequenceMap[ficheId] = 0;
+    icsSequenceMap[ficheId]++;
+    const sequence = icsSequenceMap[ficheId];
 
-function startAutoSave() {
-    autoSaveTimer = setInterval(async () => {
-        if (dataChanged) {
-            await saveData();
-        }
-    }, AUTO_SAVE_INTERVAL);
-    
-    console.log('⏰ Auto-save activé (toutes les 30 secondes)');
-}
+    const startParts = startTime.split(':');
+    const endParts = endTime.split(':');
+    const dateParts = date.split('-');
 
-function stopAutoSave() {
-    if (autoSaveTimer) {
-        clearInterval(autoSaveTimer);
-        console.log('⏰ Auto-save désactivé');
-    }
+    const dtStart = dateParts.join('') + 'T' + startParts[0].padStart(2,'0') + startParts[1].padStart(2,'0') + '00';
+    const dtEnd = dateParts.join('') + 'T' + endParts[0].padStart(2,'0') + endParts[1].padStart(2,'0') + '00';
+    const now = new Date().toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,'');
+
+    return [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//Studio CIC//Contact Studio//FR',
+        'CALSCALE:GREGORIAN',
+        'METHOD:REQUEST',
+        'BEGIN:VEVENT',
+        'DTSTART;TZID=Europe/Paris:' + dtStart,
+        'DTEND;TZID=Europe/Paris:' + dtEnd,
+        'DTSTAMP:' + now,
+        'UID:' + uid,
+        'SEQUENCE:' + sequence,
+        'SUMMARY:' + title,
+        'LOCATION:' + location,
+        'DESCRIPTION:Fiche Contact Studio transmise automatiquement',
+        'ORGANIZER;CN=CONTACT:mailto:lezenes.vincent@gmail.com',
+        'ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:vincent.lezenes@cic.fr',
+        'CATEGORIES:' + (cal.category || 'Catégorie Bleue'),
+        'X-MICROSOFT-CDO-BUSYSTATUS:BUSY',
+        'X-MICROSOFT-CDO-INTENDEDSTATUS:BUSY',
+        'COLOR:blue',
+        'STATUS:CONFIRMED',
+        'BEGIN:VALARM',
+        'TRIGGER:-PT30M',
+        'ACTION:DISPLAY',
+        'DESCRIPTION:Rappel Studio CIC',
+        'END:VALARM',
+        'END:VEVENT',
+        'END:VCALENDAR'
+    ].join('\r\n');
 }
 
 // ========================================
@@ -186,294 +131,463 @@ function stopAutoSave() {
 
 app.get('/', (req, res) => {
     res.send(`
-        <h1>🚀 eCamm Overlay WebSocket Server v2.0</h1>
+        <h1>🚀 eCamm Overlay WebSocket Server v3.0</h1>
         <p><strong>Status:</strong> ✅ Online</p>
         <p><strong>Connected clients:</strong> ${clients.size}</p>
         <p><strong>History size:</strong> ${contentHistory.length} items</p>
         <p><strong>Latest title:</strong> ${latestData.titre}</p>
-        <p><strong>Data changed:</strong> ${dataChanged ? '⚠️ Yes (pending save)' : '✅ No'}</p>
-        <hr>
-        <h3>📡 API Endpoints:</h3>
-        <ul>
-            <li><strong>GET</strong> /api/data - Récupérer les dernières données</li>
-            <li><strong>GET</strong> /api/history - Récupérer tout l'historique</li>
-            <li><strong>GET</strong> /api/backups - Lister les backups disponibles</li>
-            <li><strong>POST</strong> /api/data - Mettre à jour les données</li>
-            <li><strong>POST</strong> /api/focus - Changer le focus (subjectIndex: 0-5)</li>
-            <li><strong>POST</strong> /api/save - Forcer la sauvegarde immédiate</li>
-            <li><strong>POST</strong> /api/backup - Créer un backup manuel</li>
-            <li><strong>DELETE</strong> /api/history/:id - Supprimer un élément de l'historique</li>
-        </ul>
-        <hr>
-        <h3>💾 Persistance:</h3>
-        <ul>
-            <li>Auto-save: Toutes les 30 secondes si changements</li>
-            <li>Backup automatique: Toutes les heures</li>
-            <li>Backups gardés: 20 derniers</li>
-        </ul>
+        <p><strong>Graph settings last updated:</strong> ${graphSettings.lastUpdated}</p>
+        <p><strong>Email:</strong> ✅ ICS Calendar enabled</p>
     `);
 });
 
 app.get('/api/data', (req, res) => {
-    console.log('📤 GET /api/data');
     res.json(latestData);
 });
 
-app.get('/api/history', (req, res) => {
-    console.log('📤 GET /api/history -', contentHistory.length, 'éléments');
-    res.json(contentHistory);
-});
-
-app.get('/api/backups', async (req, res) => {
-    try {
-        const files = await fs.readdir(BACKUP_DIR);
-        const backups = files
-            .filter(f => f.startsWith('backup_'))
-            .sort()
-            .reverse()
-            .map(f => ({
-                filename: f,
-                path: `/api/backups/${f}`,
-                timestamp: f.replace('backup_', '').replace('.json', '')
-            }));
-        
-        res.json({ backups, count: backups.length });
-    } catch (error) {
-        res.status(500).json({ error: 'Error listing backups' });
-    }
-});
-
-app.post('/api/data', (req, res) => {
-    console.log('📥 POST /api/data');
-    
+app.post('/api/update', (req, res) => {
     latestData = req.body;
-    dataChanged = true;
-    
-    // Ajouter à l'historique
     const historyItem = {
         id: 'api-' + Date.now(),
         timestamp: new Date().toISOString(),
         source: 'api',
         ...latestData
     };
-    
     contentHistory.unshift(historyItem);
-    
     if (contentHistory.length > MAX_HISTORY) {
         contentHistory = contentHistory.slice(0, MAX_HISTORY);
     }
-    
-    console.log('✅ Données mises à jour (en attente de sauvegarde)');
-    
-    // Broadcaster
-    broadcastToClients({
-        type: 'update',
-        data: latestData
+    const message = JSON.stringify({ type: 'update', data: latestData });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) client.send(message);
     });
-    
-    res.json({ 
-        success: true, 
-        message: 'Données mises à jour',
-        historySize: contentHistory.length,
-        willSaveIn: `${AUTO_SAVE_INTERVAL / 1000}s max`
-    });
+    res.json({ success: true, data: latestData });
 });
 
 app.post('/api/focus', (req, res) => {
     const { subjectIndex } = req.body;
-    
-    console.log('🎯 POST /api/focus - subjectIndex:', subjectIndex);
-    
-    if (subjectIndex === undefined || subjectIndex === null) {
-        return res.status(400).json({ 
-            success: false, 
-            error: 'subjectIndex is required' 
+    console.log(`📌 Focus demandé sur l'index: ${subjectIndex}`);
+    const message = JSON.stringify({ type: 'focus', subjectIndex });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) client.send(message);
+    });
+    res.json({ success: true, subjectIndex });
+});
+
+app.get('/api/graph', (req, res) => {
+    res.json(graphSettings);
+});
+
+app.post('/api/graph', (req, res) => {
+    graphSettings = { ...req.body, lastUpdated: new Date().toISOString() };
+    const message = JSON.stringify({ type: 'graph_settings', settings: graphSettings });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) client.send(message);
+    });
+    res.json({ success: true, settings: graphSettings });
+});
+
+app.get('/history', (req, res) => {
+    res.json(contentHistory);
+});
+
+// ========================================
+// FICHES STUDIO
+// ========================================
+
+app.post('/api/fiches', (req, res) => {
+    const data = req.body;
+    if (!data || !data.id) return res.status(400).json({ error: 'Missing fiche id' });
+    fichesStore[data.id] = data;
+    console.log('📝 Fiche sauvegardée:', data.id, data.titre || '(sans titre)');
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'fiche_updated', data }));
+        }
+    });
+    res.json({ success: true, id: data.id });
+});
+
+app.get('/api/fiches/:id', (req, res) => {
+    const fiche = fichesStore[req.params.id];
+    if (!fiche) return res.status(404).json({ error: 'Fiche not found' });
+    res.json(fiche);
+});
+
+app.get('/api/fiches', (req, res) => {
+    const list = Object.values(fichesStore).map(f => ({
+        id: f.id, titre: f.titre || '(sans titre)', date: f.date || '', updatedAt: f.updatedAt || ''
+    }));
+    list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+    res.json(list);
+});
+
+app.delete('/api/fiches/:id', (req, res) => {
+    if (fichesStore[req.params.id]) {
+        delete fichesStore[req.params.id];
+        console.log('🗑️ Fiche supprimée:', req.params.id);
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'Fiche not found' });
+    }
+});
+
+// ========================================
+// EMAIL - ENVOI FICHE + ICS
+// ========================================
+
+app.post('/api/send-fiche', async (req, res) => {
+    try {
+        const { to, subject, html, calendarDirect, calendarPrep, calendar } = req.body;
+        if (!to || !subject || !html) {
+            return res.status(400).json({ error: 'Missing to, subject, or html' });
+        }
+
+        const results = [];
+
+        // 1) Event CONTACT (direct) - mail principal avec HTML fiche
+        if (calendarDirect && calendarDirect.date) {
+            const ics = generateICS({...calendarDirect, category: 'Catégorie Bleue'});
+            await mailTransporter.sendMail({
+                from: '"CONTACT" <lezenes.vincent@gmail.com>',
+                to: to,
+                subject: subject,
+                html: html,
+                icalEvent: { filename: 'invitation.ics', method: 'REQUEST', content: ics },
+                attachments: [{ filename: 'invitation.ics', content: ics, contentType: 'text/calendar; method=REQUEST' }]
+            });
+            console.log('📧 Mail CONTACT sent:', calendarDirect.startTime, '-', calendarDirect.endTime);
+            results.push('contact');
+        }
+
+        // Petit délai pour qu'Outlook traite le premier avant le second
+        if (calendarDirect && calendarPrep) {
+            await new Promise(r => setTimeout(r, 2000));
+        }
+
+        // 2) Event PRÉPA - mail séparé
+        if (calendarPrep && calendarPrep.date) {
+            const ics = generateICS({...calendarPrep, category: 'Catégorie Rouge'});
+            const prepSubject = (calendarPrep.title || 'PRÉPA') ;
+            await mailTransporter.sendMail({
+                from: '"CONTACT" <lezenes.vincent@gmail.com>',
+                to: to,
+                subject: prepSubject,
+                html: '<p style="font-family:Arial;color:#333;">Bloc préparation studio - ' + prepSubject + '</p>',
+                icalEvent: { filename: 'invitation.ics', method: 'REQUEST', content: ics },
+                attachments: [{ filename: 'invitation.ics', content: ics, contentType: 'text/calendar; method=REQUEST' }]
+            });
+            console.log('📧 Mail PRÉPA sent:', calendarPrep.startTime, '-', calendarPrep.endTime);
+            results.push('prepa');
+        }
+
+        // Rétrocompatibilité ancien format (un seul event)
+        if (calendar && calendar.date && results.length === 0) {
+            const ics = generateICS(calendar);
+            await mailTransporter.sendMail({
+                from: '"CONTACT" <lezenes.vincent@gmail.com>',
+                to: to,
+                subject: subject,
+                html: html,
+                icalEvent: { filename: 'invitation.ics', method: 'REQUEST', content: ics },
+                attachments: [{ filename: 'invitation.ics', content: ics, contentType: 'text/calendar; method=REQUEST' }]
+            });
+            results.push('legacy');
+        }
+
+        // Si aucun calendrier, juste le mail
+        if (results.length === 0) {
+            await mailTransporter.sendMail({
+                from: '"CONTACT" <lezenes.vincent@gmail.com>',
+                to: to,
+                subject: subject,
+                html: html
+            });
+            results.push('html-only');
+        }
+
+        console.log('✅ All sent:', results.join(', '));
+        res.json({ ok: true, sent: results });
+    } catch (err) {
+        console.error('❌ Email error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ========================================
+// STUDIO 2027 - SUIVI TRAVAUX
+// ========================================
+
+let studio2027Data = null;
+const STUDIO2027_FILE = '/app/data/studio2027.json';
+
+// Charger depuis le disque au démarrage
+try {
+    if (fs.existsSync(STUDIO2027_FILE)) {
+        studio2027Data = JSON.parse(fs.readFileSync(STUDIO2027_FILE, 'utf8'));
+        console.log('📋 Studio 2027 data loaded from disk');
+    }
+} catch (err) {
+    console.error('❌ Error loading studio2027:', err.message);
+}
+
+app.get('/api/studio2027', (req, res) => {
+    if (studio2027Data) {
+        res.json(studio2027Data);
+    } else {
+        res.status(404).json({ error: 'No data yet' });
+    }
+});
+
+app.post('/api/studio2027', (req, res) => {
+    studio2027Data = req.body;
+    // Sauvegarder sur disque persistant
+    try {
+        fs.writeFileSync(STUDIO2027_FILE, JSON.stringify(studio2027Data, null, 2));
+        console.log('💾 Studio 2027 saved to disk');
+    } catch (err) {
+        console.error('❌ Error saving studio2027:', err.message);
+    }
+    // Broadcast aux autres clients
+    const message = JSON.stringify({ type: 'studio2027', data: studio2027Data });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) client.send(message);
+    });
+    res.json({ success: true });
+});
+
+// ========================================
+// UPLOAD & GESTION VIDÉOS
+// ========================================
+
+app.post('/api/upload-video', (req, res) => {
+    const filename = req.headers['x-filename'];
+    if (!filename) {
+        return res.status(400).json({ error: 'Missing X-Filename header' });
+    }
+
+    // Nettoyer le nom de fichier
+    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const filePath = path.join(VIDEOS_DIR, safeName);
+
+    console.log('🎬 Upload vidéo:', safeName);
+
+    const writeStream = fs.createWriteStream(filePath);
+    req.pipe(writeStream);
+
+    writeStream.on('finish', () => {
+        const stats = fs.statSync(filePath);
+        console.log('✅ Vidéo sauvegardée:', safeName, '(' + (stats.size / 1024 / 1024).toFixed(1) + ' MB)');
+        res.json({
+            success: true,
+            filename: safeName,
+            size: stats.size,
+            url: '/videos/' + safeName
+        });
+    });
+
+    writeStream.on('error', (err) => {
+        console.error('❌ Erreur upload:', err);
+        res.status(500).json({ error: 'Upload failed: ' + err.message });
+    });
+});
+
+app.get('/api/videos-list', (req, res) => {
+    try {
+        const files = fs.readdirSync(VIDEOS_DIR).filter(f => !f.startsWith('.'));
+        const list = files.map(f => {
+            const stats = fs.statSync(path.join(VIDEOS_DIR, f));
+            return { filename: f, size: stats.size, url: '/videos/' + f };
+        });
+        res.json(list);
+    } catch (err) {
+        res.json([]);
+    }
+});
+
+app.delete('/api/videos/:filename', (req, res) => {
+    const filePath = path.join(VIDEOS_DIR, req.params.filename);
+    if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log('🗑️ Vidéo supprimée:', req.params.filename);
+        res.json({ success: true });
+    } else {
+        res.status(404).json({ error: 'File not found' });
+    }
+});
+
+// ========================================
+// PROXY VIDÉO GOOGLE DRIVE
+// ========================================
+
+const https = require('https');
+
+app.get('/api/video', (req, res) => {
+    const fileId = req.query.id;
+    if (!fileId) {
+        return res.status(400).json({ error: 'Missing ?id= parameter' });
+    }
+
+    const driveUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+    console.log('🎬 Proxy vidéo demandé:', fileId);
+
+    // Suivre les redirections Google Drive (jusqu'à 5)
+    function fetchWithRedirects(url, redirectCount) {
+        if (redirectCount > 5) {
+            console.error('❌ Trop de redirections pour', fileId);
+            return res.status(502).json({ error: 'Too many redirects' });
+        }
+
+        https.get(url, (driveRes) => {
+            // Google Drive redirige souvent (301, 302, 303)
+            if ([301, 302, 303, 307, 308].includes(driveRes.statusCode) && driveRes.headers.location) {
+                console.log('↪️ Redirect', redirectCount + 1, '→', driveRes.headers.location.substring(0, 80) + '...');
+                return fetchWithRedirects(driveRes.headers.location, redirectCount + 1);
+            }
+
+            // Google Drive affiche parfois une page "fichier trop gros, confirmer le téléchargement"
+            // Dans ce cas on reçoit du HTML au lieu de la vidéo
+            const contentType = driveRes.headers['content-type'] || '';
+
+            if (contentType.includes('text/html')) {
+                // Lire le HTML pour extraire le lien de confirmation
+                let body = '';
+                driveRes.on('data', chunk => body += chunk);
+                driveRes.on('end', () => {
+                    // Chercher le lien de confirmation dans le HTML
+                    const confirmMatch = body.match(/confirm=([^&"]+)/);
+                    if (confirmMatch) {
+                        const confirmUrl = `https://drive.google.com/uc?export=download&confirm=${confirmMatch[1]}&id=${fileId}`;
+                        console.log('🔑 Confirmation requise, retry avec confirm token');
+                        return fetchWithRedirects(confirmUrl, redirectCount + 1);
+                    }
+                    // Essayer aussi le format avec uuid
+                    const uuidMatch = body.match(/uuid=([^&"]+)/);
+                    if (uuidMatch) {
+                        const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t&uuid=${uuidMatch[1]}`;
+                        console.log('🔑 UUID confirmation, retry');
+                        return fetchWithRedirects(confirmUrl, redirectCount + 1);
+                    }
+                    console.error('❌ Google Drive a renvoyé du HTML sans lien de confirmation');
+                    res.status(502).json({ error: 'Google Drive blocked download' });
+                });
+                return;
+            }
+
+            // C'est bien une vidéo — on relaye le flux
+            console.log('✅ Vidéo reçue, Content-Type:', contentType, 'Size:', driveRes.headers['content-length'] || 'unknown');
+
+            // Déterminer le Content-Type vidéo
+            let videoType = 'video/mp4';
+            if (contentType.includes('video/')) {
+                videoType = contentType;
+            } else if (contentType.includes('quicktime') || contentType.includes('mov')) {
+                videoType = 'video/quicktime';
+            }
+
+            res.setHeader('Content-Type', videoType);
+            res.setHeader('Accept-Ranges', 'bytes');
+            if (driveRes.headers['content-length']) {
+                res.setHeader('Content-Length', driveRes.headers['content-length']);
+            }
+            // Permettre le cache navigateur (1h)
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+
+            driveRes.pipe(res);
+        }).on('error', (err) => {
+            console.error('❌ Erreur proxy vidéo:', err.message);
+            res.status(502).json({ error: 'Failed to fetch from Google Drive' });
         });
     }
-    
-    broadcastToClients({
-        type: 'focus',
-        subjectIndex: parseInt(subjectIndex)
-    });
-    
-    res.json({ 
-        success: true, 
-        message: `Focus changed to subject ${subjectIndex}`,
-        clients: clients.size
-    });
-});
 
-app.post('/api/save', async (req, res) => {
-    console.log('💾 POST /api/save - Sauvegarde forcée');
-    const success = await saveData();
-    res.json({ 
-        success, 
-        message: success ? 'Data saved successfully' : 'Save failed' 
-    });
-});
-
-app.post('/api/backup', async (req, res) => {
-    console.log('📦 POST /api/backup - Backup manuel');
-    await createBackup();
-    res.json({ success: true, message: 'Backup created' });
-});
-
-app.delete('/api/history/:id', (req, res) => {
-    const { id } = req.params;
-    const initialLength = contentHistory.length;
-    contentHistory = contentHistory.filter(item => item.id !== id);
-    dataChanged = true;
-    
-    if (contentHistory.length < initialLength) {
-        res.json({ success: true, historySize: contentHistory.length });
-    } else {
-        res.status(404).json({ success: false, error: 'Item not found' });
-    }
+    fetchWithRedirects(driveUrl, 0);
 });
 
 // ========================================
 // WEBSOCKET
 // ========================================
 
-function broadcastToClients(message) {
-    const messageStr = JSON.stringify(message);
-    let successCount = 0;
-    
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(messageStr);
-            successCount++;
-        }
-    });
-    
-    console.log(`📡 Broadcasted à ${successCount}/${clients.size} client(s)`);
-}
-
 wss.on('connection', (ws) => {
-    console.log('🔌 Nouveau client WebSocket');
+    console.log('👤 Nouveau client WebSocket connecté');
     clients.add(ws);
-    console.log('👥 Clients:', clients.size);
-    
-    // Envoyer les dernières données
+    console.log('👥 Clients connectés:', clients.size);
+
     ws.send(JSON.stringify({
-        type: 'initial',
-        data: latestData
+        type: 'init',
+        data: latestData,
+        graphSettings: graphSettings
     }));
-    
+
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            
+            console.log('📨 Message WebSocket reçu:', data.type);
+
             if (data.type === 'update') {
                 latestData = data.data;
-                dataChanged = true;
-                
                 const historyItem = {
                     id: 'ws-' + Date.now(),
                     timestamp: new Date().toISOString(),
                     source: 'websocket',
                     ...latestData
                 };
-                
                 contentHistory.unshift(historyItem);
-                
                 if (contentHistory.length > MAX_HISTORY) {
                     contentHistory = contentHistory.slice(0, MAX_HISTORY);
                 }
-                
-                // Broadcaster aux autres
                 clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({
-                            type: 'update',
-                            data: latestData
-                        }));
+                        client.send(JSON.stringify({ type: 'update', data: latestData }));
                     }
                 });
             }
+
+            if (data.type === 'graph_settings') {
+                graphSettings = { ...data.settings, lastUpdated: new Date().toISOString() };
+                clients.forEach(client => {
+                    if (client !== ws && client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({ type: 'graph_settings', settings: graphSettings }));
+                    }
+                });
+            }
+
+            if (data.type === 'focus') {
+                clients.forEach(client => {
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({ type: 'focus', subjectIndex: data.subjectIndex }));
+                    }
+                });
+            }
+
         } catch (error) {
-            console.error('❌ Erreur WebSocket:', error);
+            console.error('❌ Erreur parsing message WebSocket:', error);
         }
     });
-    
+
     ws.on('close', () => {
-        console.log('🔌 Client déconnecté');
         clients.delete(ws);
-        console.log('👥 Clients:', clients.size);
+        console.log('👥 Clients connectés:', clients.size);
     });
-    
+
     ws.on('error', (error) => {
-        console.error('❌ Erreur:', error);
+        console.error('❌ Erreur WebSocket:', error);
         clients.delete(ws);
     });
 });
 
 // ========================================
-// BACKUP AUTOMATIQUE (toutes les heures)
-// ========================================
-
-setInterval(async () => {
-    console.log('📦 Backup automatique horaire...');
-    await createBackup();
-}, 3600000); // 1 heure
-
-// ========================================
-// GRACEFUL SHUTDOWN
-// ========================================
-
-async function shutdown() {
-    console.log('\n⚠️  Arrêt du serveur...');
-    
-    stopAutoSave();
-    
-    // Sauvegarder avant de quitter
-    if (dataChanged) {
-        console.log('💾 Sauvegarde finale...');
-        await saveData();
-    }
-    
-    // Créer un backup final
-    await createBackup();
-    
-    console.log('✅ Arrêt propre terminé');
-    process.exit(0);
-}
-
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
-
-// ========================================
 // DÉMARRAGE
 // ========================================
 
-async function start() {
-    console.log('🚀 Démarrage du serveur...');
-    
-    await ensureDataDir();
-    await loadData();
-    startAutoSave();
-    
-    const PORT = process.env.PORT || 3000;
-    server.listen(PORT, () => {
-        console.log('');
-        console.log('🚀 ========================================');
-        console.log('   eCamm Overlay Server v2.0');
-        console.log('   📡 AVEC PERSISTANCE');
-        console.log('🚀 ========================================');
-        console.log('');
-        console.log(`   🌐 HTTP: http://localhost:${PORT}`);
-        console.log(`   🔌 WebSocket: ws://localhost:${PORT}`);
-        console.log('');
-        console.log('   💾 Auto-save: Toutes les 30s');
-        console.log('   📦 Backup: Toutes les heures');
-        console.log('   📂 Données:', DATA_FILE);
-        console.log('   📚 Historique:', HISTORY_FILE);
-        console.log('');
-        console.log('   ✅ Serveur prêt !');
-        console.log('');
-        console.log('🚀 ========================================');
-        console.log('');
-    });
-}
-
-start();
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log('');
+    console.log('🚀 ========================================');
+    console.log('   eCamm Overlay WebSocket Server v3.0');
+    console.log('🚀 ========================================');
+    console.log('   📡 HTTP: http://localhost:' + PORT);
+    console.log('   🔌 WebSocket: ws://localhost:' + PORT);
+    console.log('   📧 Email + ICS: enabled');
+    console.log('   ✅ Serveur démarré !');
+    console.log('');
+});
