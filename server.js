@@ -3,32 +3,212 @@ const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Dossier vidéos sur le disque persistant
-const VIDEOS_DIR = '/app/data/videos';
-if (!fs.existsSync(VIDEOS_DIR)) {
-    fs.mkdirSync(VIDEOS_DIR, { recursive: true });
-}
-
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json());
 
-// Servir les vidéos statiques depuis le disque persistant
-app.use('/videos', express.static(VIDEOS_DIR));
+// ============================================
+// CONFIGURATION GITHUB GIST (Persistance)
+// ============================================
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const GIST_ID = process.env.GIST_ID || '';
+const GIST_FILENAME = 'ecamm-overlay-history.json';
 
-// ========================================
-// STOCKAGE EN MÉMOIRE
-// ========================================
+// ============================================
+// CONFIGURATION GMAIL SMTP
+// ============================================
+const GMAIL_USER = process.env.GMAIL_USER || '';
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD || '';
+const STUDIO_EMAIL_TO = process.env.STUDIO_EMAIL_TO || '';
 
-let latestData = {
-    titre: 'En attente...',
+let transporter = null;
+if (GMAIL_USER && GMAIL_APP_PASSWORD) {
+    transporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: GMAIL_USER,
+            pass: GMAIL_APP_PASSWORD
+        }
+    });
+    console.log('✅ Gmail SMTP configuré:', GMAIL_USER);
+}
+
+// Envoyer un email avec invitation calendrier
+async function sendCalendarEmail(fiche) {
+    if (!transporter || !STUDIO_EMAIL_TO) {
+        console.log('⚠️ Email non configuré, skip envoi');
+        return;
+    }
+    if (!fiche.date) {
+        console.log('⚠️ Pas de date dans la fiche, skip envoi email');
+        return;
+    }
+
+    const dateStr = fiche.date.replace(/-/g, '');
+    let dtStart, dtEnd;
+    
+    if (fiche.heureDirect) {
+        const heureStart = fiche.heureDirect.replace(':', '') + '00';
+        dtStart = dateStr + 'T' + heureStart;
+        const [h, m] = fiche.heureDirect.split(':').map(Number);
+        const endM = m + 30;
+        const finalH = endM >= 60 ? h + 2 : h + 1;
+        const finalM = endM >= 60 ? endM - 60 : endM;
+        dtEnd = dateStr + 'T' + String(finalH).padStart(2, '0') + String(finalM).padStart(2, '0') + '00';
+    } else {
+        dtStart = dateStr + 'T090000';
+        dtEnd = dateStr + 'T100000';
+    }
+
+    let description = [];
+    if (fiche.entite) description.push('Entite: ' + fiche.entite);
+    if (fiche.contact) description.push('Contact: ' + fiche.contact);
+    if (fiche.heurePrep) description.push('Preparation: ' + fiche.heurePrep);
+    if (fiche.heureDirect) description.push('Direct: ' + fiche.heureDirect);
+    if (fiche.application) description.push('Application: ' + fiche.application);
+    if (fiche.mode) description.push('Mode: ' + fiche.mode);
+    if (fiche.intervenants && fiche.intervenants.length) {
+        description.push('Intervenants:');
+        fiche.intervenants.forEach((p, i) => {
+            description.push('  ' + (i+1) + '. ' + [p.prenom, p.nom, p.fonction ? '(' + p.fonction + ')' : ''].filter(Boolean).join(' '));
+        });
+    }
+
+    const uid = (fiche.id || Date.now()) + '@studio-cic';
+    const summary = fiche.titre || 'Prestation Studio CIC';
+    const location = 'Studio CIC - 61 rue Taitbout, Paris 3e etage';
+    const descText = description.join('\\n');
+    const now = new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+
+    const icsContent = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//Studio CIC//Content Manager//FR',
+        'CALSCALE:GREGORIAN',
+        'METHOD:REQUEST',
+        'BEGIN:VEVENT',
+        'UID:' + uid,
+        'DTSTAMP:' + now,
+        'DTSTART;TZID=Europe/Paris:' + dtStart,
+        'DTEND;TZID=Europe/Paris:' + dtEnd,
+        'SUMMARY:' + summary,
+        'LOCATION:' + location,
+        'DESCRIPTION:' + descText,
+        'ORGANIZER;CN=Studio CIC:mailto:' + GMAIL_USER,
+        'ATTENDEE;ROLE=REQ-PARTICIPANT;RSVP=TRUE:mailto:' + STUDIO_EMAIL_TO,
+        'STATUS:CONFIRMED',
+        'SEQUENCE:0',
+        'BEGIN:VALARM',
+        'TRIGGER:-PT30M',
+        'ACTION:DISPLAY',
+        'DESCRIPTION:Preparation studio dans 30 min',
+        'END:VALARM',
+        'END:VEVENT',
+        'END:VCALENDAR'
+    ].join('\r\n');
+
+    const mailOptions = {
+        from: '"Studio CIC" <' + GMAIL_USER + '>',
+        to: STUDIO_EMAIL_TO,
+        subject: '📋 ' + summary + ' - ' + fiche.date,
+        text: 'Nouvelle prestation studio:\\n\\n' + description.join('\\n'),
+        icalEvent: {
+            method: 'REQUEST',
+            content: icsContent
+        }
+    };
+
+    try {
+        await transporter.sendMail(mailOptions);
+        console.log('📧 Email calendrier envoyé à', STUDIO_EMAIL_TO);
+    } catch (error) {
+        console.error('❌ Erreur envoi email:', error.message);
+    }
+}
+
+// ============================================
+// ÉTAT GLOBAL - P1P4 Content
+// ============================================
+let contentStore = [];
+let lastSaveTime = 0;
+const SAVE_INTERVAL = 10000; // Sauvegarder au max toutes les 10 secondes
+
+// ============================================
+// FONCTIONS GITHUB GIST
+// ============================================
+async function loadFromGist() {
+    if (!GITHUB_TOKEN || !GIST_ID) {
+        console.log('⚠️ Gist non configuré - pas de persistance');
+        return;
+    }
+    
+    try {
+        const response = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+            headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        });
+        
+        if (response.ok) {
+            const gist = await response.json();
+            if (gist.files && gist.files[GIST_FILENAME]) {
+                const content = JSON.parse(gist.files[GIST_FILENAME].content);
+                contentStore = content.history || [];
+                console.log(`✅ Historique chargé depuis Gist: ${contentStore.length} éléments`);
+            }
+        } else {
+            console.log('⚠️ Gist non trouvé, démarrage avec historique vide');
+        }
+    } catch (error) {
+        console.error('❌ Erreur chargement Gist:', error.message);
+    }
+}
+
+async function saveToGist() {
+    if (!GITHUB_TOKEN || !GIST_ID) return;
+    
+    // Limiter la fréquence de sauvegarde
+    const now = Date.now();
+    if (now - lastSaveTime < SAVE_INTERVAL) return;
+    lastSaveTime = now;
+    
+    try {
+        const response = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+            method: 'PATCH',
+            headers: {
+                'Authorization': `token ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github.v3+json',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                files: {
+                    [GIST_FILENAME]: {
+                        content: JSON.stringify({
+                            lastUpdate: new Date().toISOString(),
+                            history: contentStore
+                        }, null, 2)
+                    }
+                }
+            })
+        });
+        
+        if (response.ok) {
+            console.log(`💾 Historique sauvegardé sur Gist: ${contentStore.length} éléments`);
+        } else {
+            console.error('❌ Erreur sauvegarde Gist:', response.status);
+        }
+    } catch (error) {
+        console.error('❌ Erreur sauvegarde Gist:', error.message);
+    }
+}
+let currentContent = {
+    titre: '',
     soustitre: '',
     p1: { sujet: '', contenu: [] },
     p2: { sujet: '', contenu: [] },
@@ -36,531 +216,159 @@ let latestData = {
     p4: { sujet: '', contenu: [] }
 };
 
+// ============================================
+// ÉTAT GLOBAL - Graph 3D Settings
+// ============================================
 let graphSettings = {
-    cameraOffset: { x: 0, y: 0, z: 0 },
-    cameraAngle: { yaw: 0, pitch: 0, roll: 0 },
-    graphOffset: { x: 0, y: 0, z: 0 },
-    lightPosition: { x: 10, y: 10, z: 10 },
-    lightIntensity: 1.5,
-    labelsXOffset: { x: 0, y: 0, z: 0 },
-    labelsYOffset: { x: 0, y: 0, z: 0 },
-    barreRougeOffset: { x: 0, y: 0, z: 0 },
-    barreRougeSize: { width: 0.2, height: 15, depth: 0.2 },
-    lastUpdated: new Date().toISOString()
+    cameraOffset: { x: 0, y: 5, z: 32 },
+    cameraAngle: { horizontal: 0, vertical: -20 },
+    graphMeshOffset: { x: 0, y: 0, z: 0 },
+    lightPosition: { x: 5, y: 10, z: 7 },
+    lightIntensity: 0.6,
+    labelsXOffset: { x: 0, y: 0 },
+    labelsYOffset: { x: 0, y: 0 },
+    barreRougeOffset: { x: 0, y: -7.5, z: 0 },
+    barreRougeIntensity: 1.5,
+    barreRougeSize: { width: 9, height: 0.325, depth: 8 },
+    graphWidth: 100,
+    fontSizeLabelsX: 100,
+    fontSizeLabelsY: 128,
+    labelsXSpacing: 1.0
 };
 
-let contentHistory = [];
-const MAX_HISTORY = 50;
-const clients = new Set();
-let fichesStore = {};
+// Liste des clients connectés
+let clients = new Set();
 
-// ========================================
-// EMAIL + ICS CALENDAR
-// ========================================
-
-const mailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: 'lezenes.vincent@gmail.com',
-        pass: process.env.GMAIL_APP_PASSWORD || ''
-    }
-});
-
-const icsSequenceMap = {};
-
-function generateICS(cal) {
-    const title = cal.title || 'Studio CIC';
-    const location = cal.location || 'Studio CIC - 61 rue Taitbout, Paris 9e';
-    const date = cal.date || new Date().toISOString().split('T')[0];
-    const startTime = cal.startTime || '12:30';
-    const endTime = cal.endTime || '13:00';
-    const ficheId = cal.ficheId || Date.now().toString();
-
-    const uid = 'fiche-' + ficheId + '@studio-cic';
-    if (!icsSequenceMap[ficheId]) icsSequenceMap[ficheId] = 0;
-    icsSequenceMap[ficheId]++;
-    const sequence = icsSequenceMap[ficheId];
-
-    const startParts = startTime.split(':');
-    const endParts = endTime.split(':');
-    const dateParts = date.split('-');
-    const dtStart = dateParts.join('') + 'T' + startParts[0].padStart(2,'0') + startParts[1].padStart(2,'0') + '00';
-    const dtEnd = dateParts.join('') + 'T' + endParts[0].padStart(2,'0') + endParts[1].padStart(2,'0') + '00';
-    const now = new Date().toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,'');
-
-    return [
-        'BEGIN:VCALENDAR',
-        'VERSION:2.0',
-        'PRODID:-//Studio CIC//Contact Studio//FR',
-        'CALSCALE:GREGORIAN',
-        'METHOD:REQUEST',
-        'BEGIN:VEVENT',
-        'DTSTART;TZID=Europe/Paris:' + dtStart,
-        'DTEND;TZID=Europe/Paris:' + dtEnd,
-        'DTSTAMP:' + now,
-        'UID:' + uid,
-        'SEQUENCE:' + sequence,
-        'SUMMARY:' + title,
-        'LOCATION:' + location,
-        'DESCRIPTION:Fiche Contact Studio transmise automatiquement',
-        'ORGANIZER;CN=CONTACT:mailto:lezenes.vincent@gmail.com',
-        'ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:vincent.lezenes@cic.fr',
-        'CATEGORIES:' + (cal.category || 'Catégorie Bleue'),
-        'X-MICROSOFT-CDO-BUSYSTATUS:BUSY',
-        'X-MICROSOFT-CDO-INTENDEDSTATUS:BUSY',
-        'COLOR:blue',
-        'STATUS:CONFIRMED',
-        'BEGIN:VALARM',
-        'TRIGGER:-PT30M',
-        'ACTION:DISPLAY',
-        'DESCRIPTION:Rappel Studio CIC',
-        'END:VALARM',
-        'END:VEVENT',
-        'END:VCALENDAR'
-    ].join('\r\n');
-}
-
-// ========================================
-// ROUTES API
-// ========================================
-
-app.get('/', (req, res) => {
-    res.send(`
-        <h1>🚀 eCamm Overlay WebSocket Server v3.1</h1>
-        <p><strong>Status:</strong> ✅ Online</p>
-        <p><strong>Connected clients:</strong> ${clients.size}</p>
-        <p><strong>History size:</strong> ${contentHistory.length} items</p>
-        <p><strong>Latest title:</strong> ${latestData.titre}</p>
-        <p><strong>Graph settings last updated:</strong> ${graphSettings.lastUpdated}</p>
-        <p><strong>Email:</strong> ✅ ICS Calendar enabled</p>
-        <p><strong>Studio Alerts:</strong> ✅ Broadcast enabled</p>
-    `);
-});
-
-app.get('/api/data', (req, res) => { res.json(latestData); });
-
-app.post('/api/update', (req, res) => {
-    latestData = req.body;
-    const historyItem = {
-        id: 'api-' + Date.now(),
-        timestamp: new Date().toISOString(),
-        source: 'api',
-        ...latestData
-    };
-    contentHistory.unshift(historyItem);
-    if (contentHistory.length > MAX_HISTORY) {
-        contentHistory = contentHistory.slice(0, MAX_HISTORY);
-    }
-    const message = JSON.stringify({ type: 'update', data: latestData });
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) client.send(message);
-    });
-    res.json({ success: true, data: latestData });
-});
-
-app.post('/api/focus', (req, res) => {
-    const { subjectIndex } = req.body;
-    console.log(`📌 Focus demandé sur l'index: ${subjectIndex}`);
-    const message = JSON.stringify({ type: 'focus', subjectIndex });
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) client.send(message);
-    });
-    res.json({ success: true, subjectIndex });
-});
-
-app.get('/api/graph', (req, res) => { res.json(graphSettings); });
-
-app.post('/api/graph', (req, res) => {
-    graphSettings = { ...req.body, lastUpdated: new Date().toISOString() };
-    const message = JSON.stringify({ type: 'graph_settings', settings: graphSettings });
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) client.send(message);
-    });
-    res.json({ success: true, settings: graphSettings });
-});
-
-app.get('/history', (req, res) => { res.json(contentHistory); });
-
-// ========================================
-// FICHES STUDIO
-// ========================================
-
-app.post('/api/fiches', (req, res) => {
-    const data = req.body;
-    if (!data || !data.id) return res.status(400).json({ error: 'Missing fiche id' });
-    fichesStore[data.id] = data;
-    console.log('📝 Fiche sauvegardée:', data.id, data.titre || '(sans titre)');
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({ type: 'fiche_updated', data }));
-        }
-    });
-    res.json({ success: true, id: data.id });
-});
-
-app.get('/api/fiches/:id', (req, res) => {
-    const fiche = fichesStore[req.params.id];
-    if (!fiche) return res.status(404).json({ error: 'Fiche not found' });
-    res.json(fiche);
-});
-
-app.get('/api/fiches', (req, res) => {
-    const list = Object.values(fichesStore).map(f => ({
-        id: f.id, titre: f.titre || '(sans titre)', date: f.date || '', updatedAt: f.updatedAt || ''
-    }));
-    list.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
-    res.json(list);
-});
-
-app.delete('/api/fiches/:id', (req, res) => {
-    if (fichesStore[req.params.id]) {
-        delete fichesStore[req.params.id];
-        console.log('🗑️ Fiche supprimée:', req.params.id);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'Fiche not found' });
-    }
-});
-
-// ========================================
-// EMAIL - ENVOI FICHE + ICS
-// ========================================
-
-app.post('/api/send-fiche', async (req, res) => {
-    try {
-        const { to, subject, html, calendarDirect, calendarPrep, calendar } = req.body;
-        if (!to || !subject || !html) {
-            return res.status(400).json({ error: 'Missing to, subject, or html' });
-        }
-        const results = [];
-
-        if (calendarDirect && calendarDirect.date) {
-            const ics = generateICS({...calendarDirect, category: 'Catégorie Bleue'});
-            await mailTransporter.sendMail({
-                from: '"CONTACT" <lezenes.vincent@gmail.com>',
-                to: to, subject: subject, html: html,
-                icalEvent: { filename: 'invitation.ics', method: 'REQUEST', content: ics },
-                attachments: [{ filename: 'invitation.ics', content: ics, contentType: 'text/calendar; method=REQUEST' }]
-            });
-            results.push('contact');
-        }
-
-        if (calendarDirect && calendarPrep) {
-            await new Promise(r => setTimeout(r, 2000));
-        }
-
-        if (calendarPrep && calendarPrep.date) {
-            const ics = generateICS({...calendarPrep, category: 'Catégorie Rouge'});
-            const prepSubject = (calendarPrep.title || 'PRÉPA');
-            await mailTransporter.sendMail({
-                from: '"CONTACT" <lezenes.vincent@gmail.com>',
-                to: to, subject: prepSubject,
-                html: '<p style="font-family:Arial;color:#333;">Bloc préparation studio - ' + prepSubject + '</p>',
-                icalEvent: { filename: 'invitation.ics', method: 'REQUEST', content: ics },
-                attachments: [{ filename: 'invitation.ics', content: ics, contentType: 'text/calendar; method=REQUEST' }]
-            });
-            results.push('prepa');
-        }
-
-        if (calendar && calendar.date && results.length === 0) {
-            const ics = generateICS(calendar);
-            await mailTransporter.sendMail({
-                from: '"CONTACT" <lezenes.vincent@gmail.com>',
-                to: to, subject: subject, html: html,
-                icalEvent: { filename: 'invitation.ics', method: 'REQUEST', content: ics },
-                attachments: [{ filename: 'invitation.ics', content: ics, contentType: 'text/calendar; method=REQUEST' }]
-            });
-            results.push('legacy');
-        }
-
-        if (results.length === 0) {
-            await mailTransporter.sendMail({
-                from: '"CONTACT" <lezenes.vincent@gmail.com>',
-                to: to, subject: subject, html: html
-            });
-            results.push('html-only');
-        }
-
-        console.log('✅ All sent:', results.join(', '));
-        res.json({ ok: true, sent: results });
-    } catch (err) {
-        console.error('❌ Email error:', err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ========================================
-// STUDIO 2027 - SUIVI TRAVAUX
-// ========================================
-
-let studio2027Data = null;
-const STUDIO2027_FILE = '/app/data/studio2027.json';
-try {
-    if (fs.existsSync(STUDIO2027_FILE)) {
-        studio2027Data = JSON.parse(fs.readFileSync(STUDIO2027_FILE, 'utf8'));
-        console.log('📋 Studio 2027 data loaded from disk');
-    }
-} catch (err) { console.error('❌ Error loading studio2027:', err.message); }
-
-app.get('/api/studio2027', (req, res) => {
-    if (studio2027Data) { res.json(studio2027Data); }
-    else { res.json({}); }
-});
-
-app.post('/api/studio2027', (req, res) => {
-    studio2027Data = req.body;
-    try { fs.writeFileSync(STUDIO2027_FILE, JSON.stringify(studio2027Data, null, 2)); } catch (err) { console.error('❌ Error saving studio2027:', err.message); }
-    const message = JSON.stringify({ type: 'studio2027', data: studio2027Data });
-    clients.forEach(client => { if (client.readyState === WebSocket.OPEN) client.send(message); });
-    res.json({ success: true });
-});
-
-// ========================================
-// STUDIO ALERTS
-// ========================================
-
-let studioAlerts = [];
-const ALERTS_FILE = '/app/data/studio-alerts.json';
-try {
-    if (fs.existsSync(ALERTS_FILE)) {
-        studioAlerts = JSON.parse(fs.readFileSync(ALERTS_FILE, 'utf8'));
-        console.log('🚨 Alerts loaded:', studioAlerts.length);
-    }
-} catch (err) { console.error('Error loading alerts:', err.message); }
-
-app.get('/api/studio-alerts', (req, res) => { res.json(studioAlerts); });
-
-app.post('/api/studio-alerts', (req, res) => {
-    studioAlerts = req.body;
-    try { fs.writeFileSync(ALERTS_FILE, JSON.stringify(studioAlerts, null, 2)); } catch(e) {}
-    res.json({ success: true });
-});
-
-// ========================================
-// DEV DASHBOARD
-// ========================================
-
-let devDashboard = null;
-const DEV_FILE = '/app/data/dev-dashboard.json';
-try {
-    if (fs.existsSync(DEV_FILE)) {
-        devDashboard = JSON.parse(fs.readFileSync(DEV_FILE, 'utf8'));
-        console.log('🛠️ Dev dashboard loaded');
-    }
-} catch (err) {}
-
-app.get('/api/dev-dashboard', (req, res) => { res.json(devDashboard || {}); });
-
-app.post('/api/dev-dashboard', (req, res) => {
-    devDashboard = req.body;
-    try { fs.writeFileSync(DEV_FILE, JSON.stringify(devDashboard, null, 2)); } catch(e) {}
-    res.json({ success: true });
-});
-
-// ========================================
-// UPLOAD & GESTION VIDÉOS
-// ========================================
-
-app.post('/api/upload-video', (req, res) => {
-    const filename = req.headers['x-filename'];
-    if (!filename) { return res.status(400).json({ error: 'Missing X-Filename header' }); }
-    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const filePath = path.join(VIDEOS_DIR, safeName);
-    console.log('🎬 Upload vidéo:', safeName);
-    const writeStream = fs.createWriteStream(filePath);
-    req.pipe(writeStream);
-    writeStream.on('finish', () => {
-        const stats = fs.statSync(filePath);
-        console.log('✅ Vidéo sauvegardée:', safeName, '(' + (stats.size / 1024 / 1024).toFixed(1) + ' MB)');
-        res.json({ success: true, filename: safeName, size: stats.size, url: '/videos/' + safeName });
-    });
-    writeStream.on('error', (err) => {
-        console.error('❌ Erreur upload:', err);
-        res.status(500).json({ error: 'Upload failed: ' + err.message });
-    });
-});
-
-app.get('/api/videos-list', (req, res) => {
-    try {
-        const files = fs.readdirSync(VIDEOS_DIR).filter(f => !f.startsWith('.'));
-        const list = files.map(f => {
-            const stats = fs.statSync(path.join(VIDEOS_DIR, f));
-            return { filename: f, size: stats.size, url: '/videos/' + f };
-        });
-        res.json(list);
-    } catch (err) { res.json([]); }
-});
-
-app.delete('/api/videos/:filename', (req, res) => {
-    const filePath = path.join(VIDEOS_DIR, req.params.filename);
-    if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-        console.log('🗑️ Vidéo supprimée:', req.params.filename);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'File not found' });
-    }
-});
-
-// ========================================
-// PROXY VIDÉO GOOGLE DRIVE
-// ========================================
-
-const https = require('https');
-
-app.get('/api/video', (req, res) => {
-    const fileId = req.query.id;
-    if (!fileId) { return res.status(400).json({ error: 'Missing ?id= parameter' }); }
-    const driveUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-    console.log('🎬 Proxy vidéo demandé:', fileId);
-
-    function fetchWithRedirects(url, redirectCount) {
-        if (redirectCount > 5) {
-            console.error('❌ Trop de redirections pour', fileId);
-            return res.status(502).json({ error: 'Too many redirects' });
-        }
-        https.get(url, (driveRes) => {
-            if ([301, 302, 303, 307, 308].includes(driveRes.statusCode) && driveRes.headers.location) {
-                return fetchWithRedirects(driveRes.headers.location, redirectCount + 1);
-            }
-            const contentType = driveRes.headers['content-type'] || '';
-            if (contentType.includes('text/html')) {
-                let body = '';
-                driveRes.on('data', chunk => body += chunk);
-                driveRes.on('end', () => {
-                    const confirmMatch = body.match(/confirm=([^&"]+)/);
-                    if (confirmMatch) {
-                        const confirmUrl = `https://drive.google.com/uc?export=download&confirm=${confirmMatch[1]}&id=${fileId}`;
-                        return fetchWithRedirects(confirmUrl, redirectCount + 1);
-                    }
-                    const uuidMatch = body.match(/uuid=([^&"]+)/);
-                    if (uuidMatch) {
-                        const confirmUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t&uuid=${uuidMatch[1]}`;
-                        return fetchWithRedirects(confirmUrl, redirectCount + 1);
-                    }
-                    res.status(502).json({ error: 'Google Drive blocked download' });
-                });
-                return;
-            }
-            let videoType = 'video/mp4';
-            if (contentType.includes('video/')) videoType = contentType;
-            res.setHeader('Content-Type', videoType);
-            res.setHeader('Accept-Ranges', 'bytes');
-            if (driveRes.headers['content-length']) res.setHeader('Content-Length', driveRes.headers['content-length']);
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            driveRes.pipe(res);
-        }).on('error', (err) => {
-            console.error('❌ Erreur proxy vidéo:', err.message);
-            res.status(502).json({ error: 'Failed to fetch from Google Drive' });
-        });
-    }
-    fetchWithRedirects(driveUrl, 0);
-});
-
-// ========================================
-// WEBSOCKET
-// ========================================
-
+// ============================================
+// WebSocket - Gestion des connexions
+// ============================================
 wss.on('connection', (ws) => {
-    console.log('👤 Nouveau client WebSocket connecté');
+    console.log('✅ Nouveau client connecté');
     clients.add(ws);
-    console.log('👥 Clients connectés:', clients.size);
+    console.log(`👥 Clients connectés: ${clients.size}`);
 
+    // Envoyer le contenu actuel au nouveau client
     ws.send(JSON.stringify({
-        type: 'init',
-        data: latestData,
-        graphSettings: graphSettings
+        type: 'initial',
+        data: currentContent
     }));
 
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            console.log('📨 Message WebSocket reçu:', data.type);
+            console.log('📨 Message reçu:', data.type);
 
-            if (data.type === 'update') {
-                latestData = data.data;
-                const historyItem = {
-                    id: 'ws-' + Date.now(),
-                    timestamp: new Date().toISOString(),
-                    source: 'websocket',
-                    ...latestData
-                };
-                contentHistory.unshift(historyItem);
-                if (contentHistory.length > MAX_HISTORY) contentHistory = contentHistory.slice(0, MAX_HISTORY);
+            // Message de type 'update' pour Graph 3D settings
+            if (data.type === 'update' && data.settings) {
+                graphSettings = { ...graphSettings, ...data.settings };
+                console.log('💾 Graph settings sauvegardés');
+
+                // Broadcaster aux autres clients
                 clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'update', data: latestData }));
+                        client.send(JSON.stringify({
+                            type: 'update',
+                            settings: graphSettings
+                        }));
                     }
                 });
             }
+            
+            // Message de type 'content' pour P1P4
+            if (data.type === 'content' && data.data) {
+                currentContent = data.data;
+                console.log('💾 Contenu P1P4 sauvegardé:', currentContent.titre);
 
-            if (data.type === 'graph_settings') {
-                graphSettings = { ...data.settings, lastUpdated: new Date().toISOString() };
+                // Broadcaster à TOUS les clients (y compris widgets)
                 clients.forEach(client => {
-                    if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'graph_settings', settings: graphSettings }));
+                    if (client.readyState === WebSocket.OPEN) {
+                        client.send(JSON.stringify({
+                            type: 'update',
+                            data: currentContent
+                        }));
                     }
                 });
+                console.log('📤 Contenu diffusé à tous les clients');
             }
 
+            // Message de type 'focus' pour navigation NEXT
             if (data.type === 'focus') {
-                clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify({ type: 'focus', subjectIndex: data.subjectIndex }));
-                    }
-                });
-            }
-
-            // ======== STUDIO ALERTS BROADCAST ========
-            if (data.type === 'studio-alert' || data.type === 'studio-alert-update') {
-                console.log('🚨 Alert broadcast:', data.type, data.data ? data.data.id : '');
-                // Save to disk
-                if (data.type === 'studio-alert' && data.data) {
-                    if (!studioAlerts.find(a => a.id === data.data.id)) {
-                        studioAlerts.unshift(data.data);
-                        try { fs.writeFileSync(ALERTS_FILE, JSON.stringify(studioAlerts, null, 2)); } catch(e) {}
-                    }
-                }
-                if (data.type === 'studio-alert-update' && data.data) {
-                    const alert = studioAlerts.find(a => a.id === data.data.id);
-                    if (alert) {
-                        alert.status = data.data.status;
-                        try { fs.writeFileSync(ALERTS_FILE, JSON.stringify(studioAlerts, null, 2)); } catch(e) {}
-                    }
-                }
-                // Broadcast to ALL other clients
+                console.log('🎯 Focus reçu, diffusion aux widgets');
                 clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify(data));
+                        client.send(JSON.stringify({
+                            type: 'focus',
+                            subjectIndex: data.subjectIndex
+                        }));
                     }
                 });
             }
-
-            // ======== DEV DASHBOARD BROADCAST ========
-            if (data.type === 'dev-dashboard-update') {
+            
+            // Message de type 'control' pour les commandes du joystick
+            if (data.type === 'control') {
+                console.log('🎮 Commande control reçue:', data.command);
+                
+                // Broadcaster à tous les autres clients (widgets)
                 clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
-                        client.send(JSON.stringify(data));
+                        client.send(JSON.stringify({
+                            type: 'control',
+                            command: data.command,
+                            state: data.state
+                        }));
                     }
                 });
+                console.log('📤 Commande diffusée aux widgets');
             }
-if (data.type === 'synthe_update') {
-                const msg = JSON.stringify({ type: 'synthe_update', data: data.data });
-                clients.forEach(client => {
-                    if (client.readyState === WebSocket.OPEN) {
-                        client.send(msg);
-                    }
-                });
-                console.log('🎬 Synthé update:', data.data ? data.data.nom : 'OFF');
+
+            // ---- FICHES STUDIO via WebSocket ----
+            if (data.type === 'fiches_get') {
+                ws.send(JSON.stringify({
+                    type: 'fiches_data',
+                    data: fichesStore
+                }));
             }
+
+            if (data.type === 'fiches_save') {
+                const fiche = data.fiche;
+                if (fiche && fiche.id) {
+                    fiche.updatedAt = new Date().toISOString();
+                    fichesStore[fiche.id] = fiche;
+                    console.log('📋 Fiche sauvegardée via WS:', fiche.titre || fiche.id);
+
+                    // Broadcaster à TOUS les clients
+                    const msg = JSON.stringify({ type: 'fiches_updated', data: fichesStore });
+                    clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(msg);
+                        }
+                    });
+                }
+            }
+
+            if (data.type === 'fiches_delete') {
+                if (data.id && fichesStore[data.id]) {
+                    delete fichesStore[data.id];
+                    console.log('🗑️ Fiche supprimée via WS:', data.id);
+
+                    const msg = JSON.stringify({ type: 'fiches_updated', data: fichesStore });
+                    clients.forEach(client => {
+                        if (client.readyState === WebSocket.OPEN) {
+                            client.send(msg);
+                        }
+                    });
+                }
+            }
+
         } catch (error) {
-            console.error('❌ Erreur parsing message WebSocket:', error);
+            console.error('❌ Erreur parsing message:', error);
         }
     });
 
     ws.on('close', () => {
+        console.log('🔌 Client déconnecté');
         clients.delete(ws);
-        console.log('👥 Clients connectés:', clients.size);
+        console.log(`👥 Clients restants: ${clients.size}`);
     });
 
     ws.on('error', (error) => {
@@ -569,21 +377,347 @@ if (data.type === 'synthe_update') {
     });
 });
 
-// ========================================
-// DÉMARRAGE
-// ========================================
+// ============================================
+// API REST - Routes P1P4
+// ============================================
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+// GET /api/content - Récupérer le contenu actuel
+app.get('/api/content', (req, res) => {
+    res.json(currentContent);
+});
+
+// POST /api/content - Envoyer du contenu (et broadcaster)
+app.post('/api/content', (req, res) => {
+    currentContent = req.body;
+    console.log('📝 Contenu reçu via API:', currentContent.titre);
+    
+    // Broadcaster à tous les clients WebSocket
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                type: 'update',
+                data: currentContent
+            }));
+        }
+    });
+    
+    res.json({ success: true, data: currentContent });
+});
+
+// GET /api/history - Récupérer l'historique
+app.get('/api/history', (req, res) => {
+    res.json(contentStore);
+});
+
+// POST /api/history - Ajouter à l'historique
+app.post('/api/history', (req, res) => {
+    const item = {
+        ...req.body,
+        id: 'api-' + Date.now(),
+        timestamp: new Date().toISOString(),
+        source: 'api'
+    };
+    contentStore.unshift(item);
+    
+    // Garder max 50 éléments
+    if (contentStore.length > 50) {
+        contentStore = contentStore.slice(0, 50);
+    }
+    
+    console.log('📚 Historique mis à jour:', contentStore.length, 'éléments');
+    saveToGist(); // Sauvegarder sur Gist
+    res.json({ success: true, item });
+});
+
+// POST /api/data - Alias pour /api/content (compatibilité)
+app.post('/api/data', (req, res) => {
+    const item = {
+        ...req.body,
+        id: 'api-' + Date.now(),
+        timestamp: new Date().toISOString(),
+        source: 'api'
+    };
+    contentStore.unshift(item);
+    
+    if (contentStore.length > 50) {
+        contentStore = contentStore.slice(0, 50);
+    }
+    
+    // Aussi mettre à jour currentContent et broadcaster
+    if (req.body.titre || req.body.title) {
+        currentContent = {
+            titre: req.body.title || req.body.titre || '',
+            soustitre: req.body.subtitle || req.body.soustitre || '',
+            p1: req.body.p1 || { sujet: '', contenu: [] },
+            p2: req.body.p2 || { sujet: '', contenu: [] },
+            p3: req.body.p3 || { sujet: '', contenu: [] },
+            p4: req.body.p4 || { sujet: '', contenu: [] }
+        };
+        
+        clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(JSON.stringify({
+                    type: 'update',
+                    data: currentContent
+                }));
+            }
+        });
+    }
+    
+    saveToGist(); // Sauvegarder sur Gist
+    res.json({ success: true, data: item });
+});
+
+// DELETE /api/history/:id - Supprimer un élément
+app.delete('/api/history/:id', (req, res) => {
+    const id = req.params.id;
+    contentStore = contentStore.filter(item => item.id !== id);
+    console.log('🗑️ Élément supprimé:', id);
+    saveToGist(); // Sauvegarder sur Gist
+    res.json({ success: true });
+});
+
+// ============================================
+// API REST - Routes Graph 3D
+// ============================================
+app.get('/api/settings', (req, res) => {
+    res.json(graphSettings);
+});
+
+app.post('/api/settings', (req, res) => {
+    graphSettings = { ...graphSettings, ...req.body };
+    res.json({ success: true, settings: graphSettings });
+});
+
+// ============================================
+// ÉTAT GLOBAL - Fiches Studio
+// ============================================
+let fichesStore = {};
+
+// ============================================
+// API REST - Routes Fiches Studio
+// ============================================
+
+// GET /api/fiches - Récupérer toutes les fiches
+app.get('/api/fiches', (req, res) => {
+    res.json(fichesStore);
+});
+
+// POST /api/fiches - Créer/Mettre à jour une fiche
+app.post('/api/fiches', (req, res) => {
+    const fiche = req.body;
+    if (!fiche.id) {
+        fiche.id = 'fiche-' + Date.now();
+    }
+    fiche.updatedAt = new Date().toISOString();
+    fichesStore[fiche.id] = fiche;
+    
+    console.log('📋 Fiche studio sauvegardée:', fiche.titre || fiche.id);
+    
+    // Envoyer email calendrier
+    sendCalendarEmail(fiche);
+    
+    // Broadcaster aux clients WebSocket
+    const msg = JSON.stringify({ type: 'fiches_updated', data: fichesStore });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(msg);
+        }
+    });
+    
+    res.json({ success: true, fiche });
+});
+
+// DELETE /api/fiches/:id - Supprimer une fiche
+app.delete('/api/fiches/:id', (req, res) => {
+    delete fichesStore[req.params.id];
+    console.log('🗑️ Fiche supprimée:', req.params.id);
+    
+    // Broadcaster aux clients WebSocket
+    const msg = JSON.stringify({ type: 'fiches_updated', data: fichesStore });
+    clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(msg);
+        }
+    });
+    
+    res.json({ success: true });
+});
+
+// ============================================
+// CALENDRIER ICS - Endpoint webcal
+// ============================================
+app.get('/api/calendar.ics', (req, res) => {
+    const fiches = Object.values(fichesStore);
+    
+    let icsContent = [
+        'BEGIN:VCALENDAR',
+        'VERSION:2.0',
+        'PRODID:-//Studio CIC//Content Manager//FR',
+        'CALSCALE:GREGORIAN',
+        'METHOD:PUBLISH',
+        'X-WR-CALNAME:Studio CIC - Prestations',
+        'X-WR-TIMEZONE:Europe/Paris'
+    ];
+    
+    fiches.forEach(fiche => {
+        if (!fiche.date) return;
+        
+        const dateStr = fiche.date.replace(/-/g, '');
+        let dtStart, dtEnd;
+        
+        if (fiche.heureDirect) {
+            const heureStart = fiche.heureDirect.replace(':', '') + '00';
+            dtStart = dateStr + 'T' + heureStart;
+            const [h, m] = fiche.heureDirect.split(':').map(Number);
+            const endM = m + 30;
+            const finalH = endM >= 60 ? h + 2 : h + 1;
+            const finalM = endM >= 60 ? endM - 60 : endM;
+            dtEnd = dateStr + 'T' + String(finalH).padStart(2, '0') + String(finalM).padStart(2, '0') + '00';
+        } else {
+            dtStart = dateStr;
+            dtEnd = dateStr;
+        }
+        
+        let description = [];
+        if (fiche.entite) description.push('Entite: ' + fiche.entite);
+        if (fiche.contact) description.push('Contact: ' + fiche.contact);
+        if (fiche.heurePrep) description.push('Heure preparation: ' + fiche.heurePrep);
+        if (fiche.heureDirect) description.push('Heure du direct: ' + fiche.heureDirect);
+        if (fiche.application) description.push('Application: ' + fiche.application);
+        if (fiche.mode) description.push('Mode: ' + fiche.mode);
+        if (fiche.intervenants && fiche.intervenants.length) {
+            description.push('Intervenants:');
+            fiche.intervenants.forEach((p, i) => {
+                description.push('  ' + (i+1) + '. ' + [p.prenom, p.nom, p.fonction ? '(' + p.fonction + ')' : '', p.entreprise ? '- ' + p.entreprise : ''].filter(Boolean).join(' '));
+            });
+        }
+        const toggles = fiche.toggles || {};
+        if (toggles.diffIBM === 'oui') {
+            let ibmInfo = 'Diffusion IBM: Oui';
+            if (fiche.ibmChaine) ibmInfo += ' - Chaine: ' + fiche.ibmChaine;
+            if (fiche.ibmLien) ibmInfo += ' - Lien: ' + fiche.ibmLien;
+            description.push(ibmInfo);
+        }
+        if (toggles.replay === 'oui') description.push('Replay: Oui');
+        if (toggles.chat === 'oui') description.push('Chat: Oui');
+        
+        const descText = description.join('\\n');
+        const uid = fiche.id + '@studio-cic';
+        const summary = fiche.titre || 'Prestation Studio';
+        const location = 'Studio CIC - 61 rue Taitbout, Paris 3e etage';
+        
+        icsContent.push('BEGIN:VEVENT');
+        icsContent.push('UID:' + uid);
+        icsContent.push('DTSTAMP:' + new Date().toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z');
+        
+        if (fiche.heureDirect) {
+            icsContent.push('DTSTART;TZID=Europe/Paris:' + dtStart);
+            icsContent.push('DTEND;TZID=Europe/Paris:' + dtEnd);
+        } else {
+            icsContent.push('DTSTART;VALUE=DATE:' + dtStart);
+            icsContent.push('DTEND;VALUE=DATE:' + dtEnd);
+        }
+        
+        icsContent.push('SUMMARY:' + summary);
+        icsContent.push('LOCATION:' + location);
+        icsContent.push('DESCRIPTION:' + descText);
+        
+        if (fiche.heurePrep) {
+            icsContent.push('BEGIN:VALARM');
+            icsContent.push('TRIGGER:-PT30M');
+            icsContent.push('ACTION:DISPLAY');
+            icsContent.push('DESCRIPTION:Preparation studio dans 30 min');
+            icsContent.push('END:VALARM');
+        }
+        
+        icsContent.push('END:VEVENT');
+    });
+    
+    icsContent.push('END:VCALENDAR');
+    
+    res.set({
+        'Content-Type': 'text/calendar; charset=utf-8',
+        'Content-Disposition': 'inline; filename="studio-cic.ics"',
+        'Cache-Control': 'no-cache, no-store, must-revalidate'
+    });
+    res.send(icsContent.join('\r\n'));
+});
+
+// ============================================
+// Route de test / Status
+// ============================================
+app.get('/', (req, res) => {
+    const gistStatus = GITHUB_TOKEN && GIST_ID 
+        ? `✅ Actif (Gist ID: ${GIST_ID.substring(0, 8)}...)` 
+        : '⚠️ Non configuré';
+    
+    res.send(`
+        <h1>🚀 Serveur eCamm Overlay</h1>
+        <p>✅ Serveur actif</p>
+        <p>👥 Clients WebSocket connectés: ${clients.size}</p>
+        <hr>
+        <h2>💾 Persistance Gist</h2>
+        <p>Status: ${gistStatus}</p>
+        <hr>
+        <h2>📺 P1P4 Content</h2>
+        <p>Titre actuel: ${currentContent.titre || '(vide)'}</p>
+        <p>Historique: ${contentStore.length} éléments</p>
+        <hr>
+        <h2>📊 Graph 3D</h2>
+        <pre>${JSON.stringify(graphSettings, null, 2)}</pre>
+        <hr>
+        <h2>📋 Fiches Studio</h2>
+        <p>Fiches enregistrées: ${Object.keys(fichesStore).length}</p>
+        <p><a href="/api/calendar.ics">📅 Calendrier ICS</a></p>
+        <hr>
+        <h3>API Endpoints:</h3>
+        <ul>
+            <li>GET /api/content - Contenu P1P4 actuel</li>
+            <li>POST /api/content - Envoyer contenu</li>
+            <li>GET /api/history - Historique</li>
+            <li>POST /api/data - Créer contenu</li>
+            <li>GET /api/settings - Graph 3D settings</li>
+            <li>GET /api/fiches - Toutes les fiches studio</li>
+            <li>POST /api/fiches - Créer/MAJ fiche</li>
+            <li>GET /api/calendar.ics - Calendrier ICS</li>
+        </ul>
+    `);
+});
+
+// ============================================
+// Démarrage du serveur
+// ============================================
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, async () => {
     console.log('');
     console.log('🚀 ========================================');
-    console.log('   eCamm Overlay WebSocket Server v3.1');
+    console.log('   Serveur eCamm Overlay');
     console.log('🚀 ========================================');
-    console.log('   📡 HTTP: http://localhost:' + PORT);
-    console.log('   🔌 WebSocket: ws://localhost:' + PORT);
-    console.log('   📧 Email + ICS: enabled');
-    console.log('   🚨 Studio Alerts: broadcast enabled');
-    console.log('   🛠️ Dev Dashboard: enabled');
-    console.log('   ✅ Serveur démarré !');
+    console.log('');
+    console.log(`   📡 HTTP: http://localhost:${PORT}`);
+    console.log(`   🔌 WebSocket: ws://localhost:${PORT}`);
+    console.log('');
+    console.log('   ✅ P1P4 Content API: Actif');
+    console.log('   ✅ Graph 3D Settings: Actif');
+    console.log('   ✅ WebSocket Broadcast: Actif');
+    
+    // Email status
+    if (GMAIL_USER && GMAIL_APP_PASSWORD && STUDIO_EMAIL_TO) {
+        console.log('   ✅ Email calendrier: Actif → ' + STUDIO_EMAIL_TO);
+    } else {
+        console.log('   ⚠️ Email non configuré (GMAIL_USER, GMAIL_APP_PASSWORD, STUDIO_EMAIL_TO)');
+    }
+    
+    // Charger l'historique depuis Gist
+    if (GITHUB_TOKEN && GIST_ID) {
+        console.log('   🔄 Chargement historique depuis Gist...');
+        await loadFromGist();
+        console.log(`   ✅ Gist Persistance: Actif (${contentStore.length} éléments)`);
+    } else {
+        console.log('   ⚠️ Gist non configuré - historique en mémoire uniquement');
+        console.log('   💡 Ajoutez GITHUB_TOKEN et GIST_ID dans Render');
+    }
+    
     console.log('');
 });
