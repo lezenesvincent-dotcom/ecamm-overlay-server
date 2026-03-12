@@ -239,6 +239,9 @@ let graphSettings = {
 // Liste des clients connectés
 let clients = new Set();
 
+// Dernier état control (positions/scales des slots)
+let lastControlState = null;
+
 // ============================================
 // WebSocket - Gestion des connexions
 // ============================================
@@ -252,6 +255,16 @@ wss.on('connection', (ws) => {
         type: 'initial',
         data: currentContent
     }));
+
+    // Envoyer le dernier état control (positions slots) si disponible
+    if (lastControlState) {
+        ws.send(JSON.stringify({
+            type: 'control',
+            command: 'UPDATE_STATE',
+            state: lastControlState
+        }));
+        console.log('📤 Dernier état control envoyé au nouveau client');
+    }
 
     ws.on('message', (message) => {
         try {
@@ -308,6 +321,11 @@ wss.on('connection', (ws) => {
             if (data.type === 'control') {
                 console.log('🎮 Commande control reçue:', data.command);
                 
+                // Mémoriser le dernier état pour les nouveaux clients
+                if (data.state) {
+                    lastControlState = data.state;
+                }
+
                 // Broadcaster à tous les autres clients (widgets)
                 clients.forEach(client => {
                     if (client !== ws && client.readyState === WebSocket.OPEN) {
