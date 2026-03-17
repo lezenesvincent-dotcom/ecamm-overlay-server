@@ -217,6 +217,11 @@ let currentContent = {
 };
 
 // ============================================
+// ÉTAT GLOBAL - Studio 2027
+// ============================================
+let studio2027Data = {"regie":[],"bureau":[{"title":"Attente de validation desk en U côté Clovis","note":"","checked":false,"open":false,"id":1771399695489,"photos":[]},{"title":"implantation des portes","note":"","checked":false,"open":false,"photos":[],"id":1771596899539}],"ccs":[{"title":"Quid de la climatisation indépendante pour les 3 pièces (studio, régie, bureau) avec des remotes indépendantes et filaires).","note":"","checked":false,"open":false,"id":1771399651611,"photos":[]},{"title":"Mobilier, chaises amphi","note":"","checked":false,"open":false,"id":1771399665205,"photos":[]},{"title":"Chiffrage podium ?","note":"","checked":false,"open":false,"id":1771399671190,"photos":[]},{"title":"Electro Vitrophanie, possibilité de zonage par paroie vitrée et effets de gradation visuel ? en attente de retour d'Helena","note":"","checked":false,"open":false,"id":1771399729258,"photos":[]}],"axians":[],"studio":[]};
+
+// ============================================
 // ÉTAT GLOBAL - Graph 3D Settings
 // ============================================
 let graphSettings = {
@@ -660,6 +665,21 @@ app.get('/api/calendar.ics', (req, res) => {
         'Cache-Control': 'no-cache, no-store, must-revalidate'
     });
     res.send(icsContent.join('\r\n'));
+});
+
+// ============================================
+// Studio 2027 API
+// ============================================
+app.get('/api/studio2027', (req, res) => {
+    res.json({ success: true, data: studio2027Data });
+});
+
+app.post('/api/studio2027', (req, res) => {
+    if (req.body && req.body.data) {
+        studio2027Data = req.body.data;
+        console.log('💾 Studio 2027 sauvegardé');
+    }
+    res.json({ success: true });
 });
 
 // ============================================
